@@ -1,150 +1,137 @@
-# app.py
 from flask import Flask, request, jsonify
-from flask_cors import CORS
-import requests, re, yfinance as yf
+from flask_cors  import CORS
+import requests, re, yfinance as yf, logging
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime    import datetime, timedelta
 
-app = Flask(__name__)
+app  = Flask(__name__)
 CORS(app)
+logging.basicConfig(level=logging.INFO)
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 # ------------------------------------------------------------------ #
 # helpers
 # ------------------------------------------------------------------ #
 def normalise(raw: str) -> str:
-    """'vhy' -> 'VHY.AX'.  If suffix already supplied, keep it."""
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
-
 def parse_exdate(txt: str):
-    """Try a handful of date formats used on InvestSMART."""
     txt = txt.strip()
-    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d/%m/%Y"):
+    for fmt in ("%d-%b-%Y", "%d %b %Y", "%d %B %Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(txt, fmt).date()
         except ValueError:
             continue
     return None
 
-
-def clean_amount(cell_text: str) -> float | None:
-    """
-    '$2.43'  -> 2.43
-    '61.79¢' -> 0.6179
-    '104c'   -> 1.04
-    '104 Cents' -> 1.04
-    """
-    txt = cell_text.strip().lower().replace("$", "").replace("cents", "").strip()
-    # cents?
-    if txt.endswith(("c", "¢")):
-        txt = txt.rstrip("c¢").strip()
-        try:
-            return float(txt) / 100.0
-        except ValueError:
-            return None
-    try:
-        return float(txt)
-    except ValueError:
-        return None
-
-
 # ------------------------------------------------------------------ #
-# main scrape  (InvestSMART)
+# table-parsing routine (works for both MarketIndex & InvestSMART)
 # ------------------------------------------------------------------ #
-def fetch_dividend_stats(code: str) -> tuple[float | None, float | None]:
-    """
-    Returns (cash_dividend_last_12m, weighted_fran_pct) or (None, None)
-    code: plain ASX code e.g. 'VHY'
-    """
-    url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
+def parse_div_table(html: str):
+    soup = BeautifulSoup(html, "html.parser")
 
-    try:
-        res = requests.get(url, headers={"User-Agent": UA}, timeout=15)
-        res.raise_for_status()
-    except Exception as e:
-        print("InvestSMART request error:", e)
-        return None, None
-
-    soup = BeautifulSoup(res.text, "html.parser")
-    div_tbl = None
+    # pick the table that is explicitly the “dividend history” one
+    candidate = None
     for tbl in soup.find_all("table"):
-        hdr = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-        if {"dividend", "franking"}.issubset(hdr):
-            div_tbl = tbl
+        caption = tbl.find("caption")
+        cls     = " ".join(tbl.get("class", [])).lower()
+        if (caption and "dividend history" in caption.get_text(strip=True).lower()) \
+           or "dividend-history" in cls or "dividend-table" in cls:
+            candidate = tbl
             break
-    if div_tbl is None:
+    if candidate is None:
         return None, None
 
-    hdr = [th.get_text(strip=True).lower() for th in div_tbl.find_all("th")]
+    hdrs = [th.get_text(strip=True).lower() for th in candidate.find_all("th")]
     try:
-        ex_i   = next(i for i, h in enumerate(hdr) if "ex" in h and "date" in h)
-        div_i  = hdr.index("dividend")
-        fran_i = hdr.index("franking")
-    except (ValueError, StopIteration):
+        ex_i  = next(i for i,h in enumerate(hdrs) if "ex" in h)
+        amt_i = hdrs.index("amount")
+        fr_i  = hdrs.index("franking")
+    except (StopIteration, ValueError):
         return None, None
 
-    cutoff = datetime.utcnow().date() - timedelta(days=365)
-    tot_div_cash = tot_fran_cash = 0.0
+    cutoff  = datetime.utcnow().date() - timedelta(days=365)
+    tot_div = tot_fran_cash = 0.0
+    kept    = 0
 
-    for tr in div_tbl.find("tbody").find_all("tr"):
+    for tr in candidate.find("tbody").find_all("tr"):
         tds = tr.find_all("td")
-        if len(tds) <= max(ex_i, div_i, fran_i):
+        if len(tds) <= max(ex_i, amt_i, fr_i):
             continue
-
         exd = parse_exdate(tds[ex_i].get_text())
         if not exd or exd < cutoff:
             continue
-
-        amt = clean_amount(tds[div_i].get_text())
-        if amt is None:
-            continue
-
         try:
-            fran_pct = float(re.sub(r"[^\d.]", "", tds[fran_i].get_text()))
+            amt = float(re.sub(r"[^\d.]", "", tds[amt_i].get_text()))
         except ValueError:
-            fran_pct = 0.0
+            continue
+        try:
+            fpc = float(re.sub(r"[^\d.]", "", tds[fr_i].get_text()))
+        except ValueError:
+            fpc = 0.0
 
-        tot_div_cash += amt
-        tot_fran_cash += amt * (fran_pct / 100.0)
+        tot_div        += amt
+        tot_fran_cash  += amt * fpc/100
+        kept           += 1
 
-    if tot_div_cash == 0:
+    logging.info("Kept %s rows within 12 m", kept)
+    if tot_div == 0:
         return None, None
-
-    weighted_pct = round((tot_fran_cash / tot_div_cash) * 100, 2)
-    return round(tot_div_cash, 6), weighted_pct
-
+    return round(tot_div, 6), round((tot_fran_cash / tot_div)*100, 2)
 
 # ------------------------------------------------------------------ #
-# Flask routes
+# primary fetch routine  (MarketIndex → fallback InvestSMART)
+# ------------------------------------------------------------------ #
+def fetch_div_data(code: str):
+    mi_url = f"https://www.marketindex.com.au/asx/{code.lower()}"
+    try:
+        r = requests.get(mi_url, headers={"User-Agent": UA}, timeout=15)
+        if r.status_code == 200:
+            out = parse_div_table(r.text)
+            if all(out):
+                return out
+        elif r.status_code != 403:
+            logging.warning("MarketIndex status %s", r.status_code)
+    except Exception as e:
+        logging.warning("MarketIndex error %s", e)
+
+    # fallback
+    is_url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
+    try:
+        r = requests.get(is_url, headers={"User-Agent": UA}, timeout=15)
+        if r.ok:
+            return parse_div_table(r.text)
+    except Exception as e:
+        logging.warning("InvestSMART error %s", e)
+
+    return None, None
+
+# ------------------------------------------------------------------ #
+# routes
 # ------------------------------------------------------------------ #
 @app.route("/")
-def home():
-    return "Stock API Proxy – call /stock?symbol=CODE  (e.g. /stock?symbol=VHY)", 200
-
+def root():
+    return "Stock API Proxy – /stock?symbol=CODE", 200
 
 @app.route("/stock")
 def stock():
-    raw = request.args.get("symbol", "")
-    if not raw.strip():
+    raw = request.args.get("symbol","").strip()
+    if not raw:
         return jsonify(error="No symbol provided"), 400
 
-    symbol = normalise(raw)
-    base   = symbol.split(".")[0]
+    symbol   = normalise(raw)
+    basecode = symbol.split(".")[0]
 
-    # 1) live price --------------------------------------------------
+    # live price
     try:
         price = float(yf.Ticker(symbol).fast_info["lastPrice"])
     except Exception as e:
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
-    # 2) dividends & franking ---------------------------------------
-    dividend12, franking = fetch_dividend_stats(base)
+    dividend12, franking = fetch_div_data(basecode)
 
     return jsonify(
         symbol     = symbol,
@@ -153,8 +140,4 @@ def stock():
         franking   = franking
     )
 
-
-# ------------------------------------------------------------------ #
-if __name__ == "__main__":
-    # local dev: python app.py
-    app.run(host="0.0.0.0", port=8080)
+# Render runs gunicorn; no __main__ section needed
