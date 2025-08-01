@@ -4,5 +4,4 @@ flask-cors
 yfinance
 pandas
 beautifulsoup4
-playwright
-gunicorn        # ← add this line
+gunicorn
