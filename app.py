@@ -79,4 +79,36 @@ def stock():
             hist.index = pd.to_datetime(hist.index)
             if hist.index.tz is not None:
                 hist.index = hist.index.tz_localize(None)
-            cutoff = pd.Timestamp.utcnow().tz_localize(_
+            cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.DateOffset(days=365)
+            dividend12 = float(hist[hist.index >= cutoff].sum())
+    except Exception as e:
+        print(f"Dividend fetch failed: {e}")
+
+    # --- Weighted franking % via ASX scrape (same 365-day window) ---
+    franking_pct = 42  # default
+    try:
+        rows = fetch_franking(base)
+        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.DateOffset(days=365)
+        tot_div = tot_frank = 0
+        for ex_dt, amt, frank in rows:
+            if ex_dt >= cutoff:
+                tot_div   += amt
+                tot_frank += amt * (frank / 100)
+        if tot_div > 0:
+            franking_pct = round((tot_frank / tot_div) * 100, 2)
+    except Exception as e:
+        print(f"Franking scrape failed: {e}")
+
+    return jsonify(
+        {
+            "symbol"    : symbol,
+            "price"     : price,
+            "dividend12": dividend12,
+            "franking"  : franking_pct,
+        }
+    )
+
+# ---------- Main ----------
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
