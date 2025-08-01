@@ -1,5 +1,3 @@
-# app.py  –  dividend + franking fetcher (InvestSMART → fallback MarketIndex)
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests, re, yfinance as yf, logging
@@ -120,5 +118,3 @@ def stock():
     dividend12, franking = fetch_div_data(basecode)
     return jsonify(symbol=symbol, price=price,
                    dividend12=dividend12, franking=franking)
-
-# gunicorn entry point (Render etc.)
