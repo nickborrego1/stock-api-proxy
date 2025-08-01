@@ -1,9 +1,12 @@
 name: Update ASX franking cache
 
+permissions:
+  contents: write
+
 on:
   schedule:
-    - cron:  '0 2 * * *'      # 02:00 UTC daily
-  workflow_dispatch:         # allows manual runs
+    - cron:  '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -35,3 +38,4 @@ jobs:
       - uses: ad-m/github-push-action@v0.6.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: main
