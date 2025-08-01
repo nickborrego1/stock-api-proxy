@@ -2,9 +2,11 @@ from flask import Flask, request, jsonify
 import requests, yfinance as yf, pandas as pd, re
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+from dateutil import parser as dtparse           # ← NEW
 from flask_cors import CORS
+import unicodedata
 
-app = Flask(__name__)               #  ← must be top-level
+app = Flask(__name__)
 CORS(app)
 
 UA = {
@@ -15,16 +17,16 @@ UA = {
     "Referer": "https://www.investsmart.com.au/",
 }
 
-# ---------- helpers ----------
 def normalise(raw: str) -> str:
-    """'vhy' → 'VHY.AX'   'vhy.ax' stays 'VHY.AX'."""
-    s = raw.strip().upper()
-    return s if "." in s else f"{s}.AX"
+    return raw.strip().upper() if "." in raw else f"{raw.strip().upper()}.AX"
+
+def clean_num(text: str) -> str:
+    """Remove $ , NBSP, and any unicode space so float() works."""
+    txt = unicodedata.normalize("NFKD", text)
+    txt = re.sub(r"[^\d.\-]", "", txt)      # keep digits, dot, minus
+    return txt or "0"
 
 def scrape_investsmart(code: str):
-    """
-    Return list of (ex_date, amount, franking%) for the last 12 months.
-    """
     url  = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
     html = requests.get(url, headers=UA, timeout=15).text
     soup = BeautifulSoup(html, "html.parser")
@@ -36,18 +38,21 @@ def scrape_investsmart(code: str):
 
     for tr in rows:
         tds = tr.find_all("td")
-        if len(tds) < 3:            # need at least Ex-Date, Amount, Franking
+        if len(tds) < 3:
             continue
 
-        raw_date = tds[0].get_text(strip=True)
-        raw_amt  = re.sub(r"[^0-9.]", "", tds[1].get_text(strip=True)) or "0"
-        raw_fr   = re.sub(r"[^0-9.]", "", tds[2].get_text(strip=True)) or "0"
+        try:
+            ex_date = dtparse.parse(tds[0].get_text(strip=True), dayfirst=True).date()
+        except Exception:
+            continue
+
+        raw_amt = clean_num(tds[1].get_text(strip=True))
+        raw_fr  = clean_num(tds[2].get_text(strip=True))
 
         try:
-            ex_date = pd.to_datetime(raw_date, dayfirst=True).date()
-            amount  = float(raw_amt)
-            frank   = float(raw_fr)
-        except Exception:
+            amount = float(raw_amt)
+            frank  = float(raw_fr)
+        except ValueError:
             continue
 
         if ex_date >= cutoff:
@@ -56,23 +61,20 @@ def scrape_investsmart(code: str):
     print(f"Kept {len(kept)} rows for {code} within 12 months")
     return kept
 
-# ---------- route ----------
 @app.route("/stock")
 def stock():
-    raw = request.args.get("symbol", "").strip()
+    raw = request.args.get("symbol","")
     if not raw:
-        return jsonify({"error": "No symbol provided"}), 400
+        return jsonify({"error":"No symbol provided"}),400
 
-    symbol = normalise(raw)          # e.g. VHY.AX
-    base   = symbol.split(".")[0]    # VHY
+    symbol = normalise(raw)
+    base   = symbol.split(".")[0]
 
-    # ---- price via yfinance ----
     try:
         price = float(yf.Ticker(symbol).fast_info["lastPrice"])
     except Exception as e:
-        return jsonify({"error": f"Price fetch failed: {e}"}), 500
+        return jsonify({"error":f"Price fetch failed: {e}"}),500
 
-    # ---- trailing-12-month dividend via yfinance ----
     dividend12 = None
     try:
         hist = yf.Ticker(symbol).dividends
@@ -83,7 +85,6 @@ def stock():
     except Exception as e:
         print("Dividend error:", e)
 
-    # ---- weighted franking via InvestSMART ----
     franking = 42
     try:
         rows = scrape_investsmart(base)
@@ -106,9 +107,7 @@ def stock():
     )
 
 @app.route("/")
-def root():
-    return "Proxy live"
+def root(): return "Proxy live"
 
-# ---------- main ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
