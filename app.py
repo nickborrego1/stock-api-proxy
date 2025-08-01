@@ -1,132 +1,90 @@
+import json
+import datetime
 from flask import Flask, request, jsonify
-from flask_cors import CORS
-import requests, yfinance as yf, pandas as pd
-from datetime import datetime, timedelta
+from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
-CORS(app)
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-)
-ASX_JSON_URL = "https://www.asx.com.au/api/markets/trade-our-cash-market/dividend-search"
-
-def normalise(raw: str) -> str:
-    s = raw.strip().upper()
-    return s if "." in s else f"{s}.AX"
-
-def fetch_franking_asx_json(code: str):
-    """Hit ASX’s JSON endpoint correctly with asxCode=CODE."""
+def scrape_marketindex(symbol):
+    url = f"https://www.marketindex.com.au/asx/{symbol.lower()}"
+    data = []
     try:
-        resp = requests.get(
-            ASX_JSON_URL,
-            params={"asxCode": code},           # ← singular
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-            timeout=10
-        )
-        resp.raise_for_status()
-        records = resp.json().get("rows", [])
-    except Exception:
-        return []
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=30000)
+            # Wait for the Dividends table
+            page.wait_for_selector("table", timeout=15000)
+            html = page.content()
+            browser.close()
+        soup = BeautifulSoup(html, "html.parser")
+        # Find the dividends table
+        table = soup.find("table", string=lambda x: x and "Ex Dividend" in x)
+        if table is None:
+            # fallback: first table
+            tables = soup.find_all("table")
+            table = tables[0] if tables else None
+        if table is None:
+            return None
 
-    cutoff = datetime.utcnow().date() - timedelta(days=365)
-    out = []
-    for r in records:
-        try:
-            ex = datetime.strptime(r["exDate"], "%d %b %Y").date()
-            if ex < cutoff:
+        rows = table.find_all("tr")[1:]  # Skip header
+        today = datetime.date.today()
+        one_year_ago = today - datetime.timedelta(days=365)
+        total_div = 0.0
+        franked_cash = 0.0
+        franked_total = 0.0
+        found_any = False
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) < 5:
                 continue
-            amt = float(r.get("dividendAmount", 0))
-            frk = float(r.get("frankingPercentage", 0))
-            out.append((ex, amt, frk))
-        except Exception:
-            continue
-    return out
-
-def fetch_franking_investsmart(code: str):
-    """Fallback scrape if ASX JSON returns empty."""
-    url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
-    try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
-        r.raise_for_status()
-    except Exception:
-        return []
-
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(r.text, "html.parser")
-    tbl = soup.find("table")
-    if not tbl or not tbl.tbody:
-        return []
-
-    cutoff = datetime.utcnow().date() - timedelta(days=365)
-    out = []
-    for tr in tbl.tbody.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 6:
-            continue
-        try:
-            ex = datetime.strptime(tds[5].get_text(strip=True), "%d %b %Y").date()
-            if ex < cutoff:
+            ex_date_str = cells[0].get_text(strip=True)
+            dividend_str = cells[2].get_text(strip=True)
+            franking_str = cells[4].get_text(strip=True)
+            try:
+                ex_date = datetime.datetime.strptime(ex_date_str, "%d-%b-%Y").date()
+            except Exception:
                 continue
-            amt = float(tds[3].get_text(strip=True).replace("$","").replace(",",""))
-            frk = float(tds[4].get_text(strip=True).replace("%",""))
-            out.append((ex, amt, frk))
-        except:
-            continue
-    return out
+            if ex_date < one_year_ago:
+                continue
+            found_any = True
+            try:
+                div = float(dividend_str.replace("$", "").replace(",", ""))
+                total_div += div
+            except Exception:
+                continue
+            try:
+                frank_pct = float(franking_str.replace("%", ""))
+                franked_cash += div * (frank_pct / 100)
+                franked_total += frank_pct
+            except Exception:
+                pass
 
-@app.route("/")
-def index():
-    return "Stock API Proxy running — use /stock?symbol=CODE", 200
+        avg_franking = (franked_cash / total_div * 100) if total_div > 0 else None
+        return {
+            "dividend12": total_div if found_any else None,
+            "franking": round(avg_franking, 2) if avg_franking else None
+        }
+    except Exception as e:
+        print("Scrape error:", e)
+        return None
 
 @app.route("/stock")
 def stock():
-    raw = request.args.get("symbol","").strip()
-    if not raw:
-        return jsonify({"error":"No symbol provided"}), 400
+    symbol = request.args.get("symbol", "VHY")
+    price = 75.25  # Placeholder, ideally get from yfinance or elsewhere
+    data = scrape_marketindex(symbol)
+    if not data:
+        return jsonify({
+            "dividend12": None,
+            "franking": None,
+            "price": price,
+            "symbol": f"{symbol}.AX"
+        })
+    data["price"] = price
+    data["symbol"] = f"{symbol}.AX"
+    return jsonify(data)
 
-    symbol = normalise(raw)
-    base   = symbol.split(".")[0]
-
-    # 1) Price
-    try:
-        tkr   = yf.Ticker(symbol)
-        price = float(tkr.fast_info["lastPrice"])
-    except Exception as e:
-        return jsonify({"error":f"Price fetch failed: {e}"}), 500
-
-    # 2) Trailing-12m dividends
-    dividend12 = None
-    try:
-        hist = tkr.dividends
-        if not hist.empty:
-            # strip any tz info
-            hist.index = pd.to_datetime(hist.index).tz_localize(None)
-            cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
-            mask = hist.index >= cutoff
-            dividend12 = float(hist.loc[mask].sum())
-    except Exception:
-        dividend12 = None
-
-    # 3) Weighted franking
-    rows = fetch_franking_asx_json(base)
-    if not rows:
-        rows = fetch_franking_investsmart(base)
-
-    franking = None
-    if rows:
-        tot_div = sum(a for _,a,_ in rows)
-        tot_frk = sum(a*(f/100) for _,a,f in rows)
-        if tot_div > 0:
-            franking = round((tot_frk / tot_div) * 100, 2)
-
-    return jsonify({
-        "symbol":     symbol,
-        "price":      price,
-        "dividend12": dividend12,
-        "franking":   franking
-    })
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=8080)
+if __name__ == "__main__":
+    app.run(debug=True)
