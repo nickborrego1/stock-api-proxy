@@ -1,55 +1,38 @@
 from flask import Flask, request, jsonify
-import requests
+import yfinance as yf
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Allow cross-origin requests
-
-ALPHA_VANTAGE_API_KEY = "5CZN15ICMRH2QQW7"
+CORS(app)
 
 @app.route("/")
 def index():
-    return "Stock API Proxy running."
+    return "Stock API Proxy (Yahoo/yfinance) running."
 
-@app.route("/stock", methods=["GET"])
+@app.route("/stock")
 def stock():
     symbol = request.args.get("symbol")
     if not symbol:
         return jsonify({"error": "No symbol provided"}), 400
 
-    # Get price
-    price_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
-    price_r = requests.get(price_url, timeout=10)
-    price_json = price_r.json()
-    price = None
     try:
-        price = float(price_json["Global Quote"]["05. price"])
-    except Exception:
-        price = None
+        ticker = yf.Ticker(symbol)
+        price  = ticker.fast_info["lastPrice"]
 
-    # Get 12m dividend sum
-    div_url = f"https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
-    div_r = requests.get(div_url, timeout=10)
-    div_json = div_r.json()
-    dividend12 = 0
-    try:
-        count = 0
-        for _, obj in div_json["Monthly Adjusted Time Series"].items():
-            dividend = float(obj["7. dividend amount"])
-            dividend12 += dividend
-            count += 1
-            if count == 12:
-                break
-    except Exception:
-        dividend12 = None
+        # trailing 12-month dividends
+        hist   = ticker.dividends
+        last12 = hist[hist.index >= hist.index.max() - pd.DateOffset(months=12)]
+        dividend12 = float(last12.sum()) if not last12.empty else None
 
-    # Franking not available via API; default 42
-    result = {
+    except Exception as e:
+        return jsonify({"error": f"Fetch failed: {e}"}), 500
+
+    return jsonify({
         "price": price,
         "dividend12": dividend12,
-        "franking": 42
-    }
-    return jsonify(result)
+        "franking": 42   # default editable
+    })
 
 if __name__ == "__main__":
+    import pandas as pd   # ensure pandas import for DateOffset
     app.run(host="0.0.0.0", port=8080)
