@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import requests, yfinance as yf, pandas as pd, re
+import requests, yfinance as yf, pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from flask_cors import CORS
@@ -7,56 +7,58 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-HEADERS = {
+UA = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36"
-    ),
-    "Referer": "https://www.asx.com.au/",
-    "Accept": "text/html,application/xhtml+xml",
+    )
 }
 
+# ---------- helpers ----------
 def normalise(raw: str) -> str:
+    """'vhy' → 'VHY.AX'   'vhy.ax' stays 'VHY.AX'."""
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
-def scrape_asx_franing(code: str):
-    """Return list of (exDate, amount, franking%) for last 365d."""
-    url = (
-        "https://www.asx.com.au/markets/trade-our-cash-market/"
-        "dividend-search?asxCode=" + code
-    )
-    for attempt in range(2):  # try twice with different headers
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(r.text, "html.parser")
-        rows = soup.select("table tbody tr")
-        print(f"Attempt {attempt+1}: scraped {len(rows)} rows for {code}")
-        if rows:
-            break
-        HEADERS["User-Agent"] += " retry"
-    cutoff = datetime.utcnow().date() - timedelta(days=365)
-    out = []
+def scrape_investsmart(code: str):
+    """
+    Scrape InvestSMART dividend table.
+    Returns list of (ex_date, amount, franking_pct).
+    """
+    url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
+    r   = requests.get(url, headers=UA, timeout=15)
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    rows  = soup.select("table tbody tr")
+    print(f"InvestSMART rows for {code}: {len(rows)}")
+    data  = []
+    date_re = "%d %b %Y"
+
     for tr in rows:
         tds = tr.find_all("td")
-        if len(tds) < 7:
+        if len(tds) < 5:          # expect: Ex-Date | Amount | Franking | ...
             continue
+        ex  = tds[0].get_text(strip=True)
+        amt = tds[1].get_text(strip=True).replace("$", "")
+        fr  = tds[2].get_text(strip=True).replace("%", "")
         try:
-            amt   = float(tds[3].get_text(strip=True).replace("$", ""))
-            frank = float(tds[4].get_text(strip=True).replace("%", ""))
-            exdt  = datetime.strptime(tds[5].get_text(strip=True), "%d %b %Y").date()
-            if exdt >= cutoff:
-                out.append((exdt, amt, frank))
+            ex_date = datetime.strptime(ex, date_re).date()
+            amount  = float(amt)
+            frank   = float(fr)
+            data.append((ex_date, amount, frank))
         except Exception:
             continue
-    return out
+    return data
 
+# ---------- route ----------
 @app.route("/stock")
 def stock():
     raw = request.args.get("symbol", "").strip()
     if not raw:
         return jsonify({"error": "No symbol provided"}), 400
-    symbol = normalise(raw)
-    base   = symbol.split(".")[0]
+
+    symbol = normalise(raw)          # e.g. VHY.AX
+    base   = symbol.split(".")[0]    # VHY
 
     # price via yfinance
     try:
@@ -64,7 +66,7 @@ def stock():
     except Exception as e:
         return jsonify({"error": f"Price fetch failed: {e}"}), 500
 
-    # dividend last 365d via yfinance
+    # trailing-12-month dividend via yfinance
     dividend12 = None
     try:
         hist = yf.Ticker(symbol).dividends
@@ -75,22 +77,30 @@ def stock():
     except Exception as e:
         print("Dividend error:", e)
 
-    # weighted franking via scrape
+    # weighted franking via InvestSMART scrape
     franking = 42
     try:
-        rows = scrape_asx_franing(base)
+        rows = scrape_investsmart(base)
+        cut  = datetime.utcnow().date() - timedelta(days=365)
         tot_div = tot_frank = 0
-        for exdt, amt, fr in rows:
-            tot_div   += amt
-            tot_frank += amt * (fr / 100)
+        for ex, amt, fr in rows:
+            if ex >= cut:
+                tot_div   += amt
+                tot_frank += amt * (fr / 100)
         if tot_div:
             franking = round((tot_frank / tot_div) * 100, 2)
     except Exception as e:
         print("Franking scrape error:", e)
 
     return jsonify(
-        {"symbol": symbol, "price": price, "dividend12": dividend12, "franking": franking}
+        {
+            "symbol": symbol,
+            "price": price,
+            "dividend12": dividend12,
+            "franking": franking,
+        }
     )
 
+# ---------- main ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
