@@ -5,7 +5,7 @@ permissions:
 
 on:
   schedule:
-    - cron:  '0 2 * * *'
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 jobs:
@@ -22,8 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright pandas beautifulsoup4 yfinance
-          python -m playwright install chromium
+          pip install requests beautifulsoup4
 
       - name: Run scraper
         run: python scrape_fran_cache.py
