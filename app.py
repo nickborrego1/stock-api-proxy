@@ -8,65 +8,96 @@ from playwright.sync_api import sync_playwright
 app = Flask(__name__)
 CORS(app)
 
-CACHE_FILE = Path("franking_cache.json")
-SECRET_TOKEN = "mySecret123"          # set a simple secret so public users can’t hit /refresh
+# ────────────────────────────── CONFIG ──────────────────────────────
+CACHE_FILE   = Path("franking_cache.json")
+SECRET_TOKEN = "mySecret123"          # <-- change if you like
+BROWSER_ARGS = ["--no-sandbox"]       # required on Render free tier
+NET_TIMEOUT  = 30_000                 # 30 s (ms) for slow first loads
+# ────────────────────────────────────────────────────────────────────
+
 
 # ---------- helpers ----------
 def normalise(raw: str) -> str:
-    return raw.strip().upper() if "." in raw else f"{raw.strip().upper()}.AX"
+    """'vhy' → 'VHY.AX';  'vhy.ax' remains 'VHY.AX'."""
+    s = raw.strip().upper()
+    return s if "." in s else f"{s}.AX"
 
 def clean_num(txt: str) -> float:
-    s = unicodedata.normalize("NFKD", txt)
-    s = re.sub(r"[^\d.]", "", s) or "0"
-    return float(s)
+    """Remove $, commas, NBSP, etc.  Return 0.0 on blanks."""
+    cleaned = re.sub(r"[^\d.]", "", unicodedata.normalize("NFKD", txt)) or "0"
+    return float(cleaned)
 
-def scrape_investsmart(symbol_base: str):
+def scrape_investsmart(symbol_base: str) -> float | None:
+    """
+    Headless Chromium scrape via Playwright.
+    Returns weighted franking % for last-365-days, or None on failure.
+    """
     url = f"https://www.investsmart.com.au/shares/asx-{symbol_base.lower()}/dividends"
+    cutoff = datetime.utcnow().date() - timedelta(days=365)
+    tot_div = tot_frank = 0
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--no-sandbox"])
+        browser = p.chromium.launch(args=BROWSER_ARGS)
         page    = browser.new_page()
-        page.goto(url, timeout=15000)
-        page.wait_for_selector("table tbody tr", timeout=15000)
+        try:
+            page.goto(url, timeout=NET_TIMEOUT)
+            # wait until no network requests for 0.5 s (React finished)
+            page.wait_for_load_state("networkidle", timeout=NET_TIMEOUT)
+        except Exception:
+            browser.close()
+            return None
+
+        # dismiss cookie banner if present
+        try:
+            page.locator("button:has-text('Accept')").click(timeout=2_000)
+        except Exception:
+            pass
+
         rows = page.query_selector_all("table tbody tr")
-        cutoff = datetime.utcnow().date() - timedelta(days=365)
-        tot_div = tot_frank = 0
         for tr in rows:
-            cells = tr.query_selector_all("td")
-            if len(cells) < 3:
+            tds = tr.query_selector_all("td")
+            if len(tds) < 3:
                 continue
-            ex_date = pd.to_datetime(cells[0].inner_text().strip(), dayfirst=True, errors="coerce").date()
-            amount  = clean_num(cells[1].inner_text().strip())
-            fr_pct  = clean_num(cells[2].inner_text().strip())
-            if ex_date and ex_date >= cutoff:
-                tot_div   += amount
-                tot_frank += amount * (fr_pct / 100)
+            ex_date = pd.to_datetime(tds[0].inner_text().strip(),
+                                     dayfirst=True, errors="coerce").date()
+            if not ex_date or ex_date < cutoff:
+                continue
+            amount = clean_num(tds[1].inner_text())
+            frank  = clean_num(tds[2].inner_text())
+            tot_div   += amount
+            tot_frank += amount * (frank / 100)
+
         browser.close()
+
     return round((tot_frank / tot_div) * 100, 2) if tot_div else None
 
-def read_cache(symbol_base):
+
+# ---------- cache helpers ----------
+def read_cache(base: str) -> float | None:
     if not CACHE_FILE.exists():
         return None
-    data = json.loads(CACHE_FILE.read_text())
-    entry = data.get(symbol_base.upper())
-    return entry["franking"] if entry else None
+    entry = json.loads(CACHE_FILE.read_text()).get(base.upper())
+    return entry.get("franking") if entry else None
 
-def update_cache(symbol_base, value):
+def update_cache(base: str, value: float):
     data = {}
     if CACHE_FILE.exists():
         data = json.loads(CACHE_FILE.read_text())
-    data[symbol_base.upper()] = {"franking": value, "timestamp": datetime.utcnow().isoformat()}
+    data[base.upper()] = {"franking": value,
+                          "timestamp": datetime.utcnow().isoformat()}
     CACHE_FILE.write_text(json.dumps(data))
+
 
 # ---------- routes ----------
 @app.route("/stock")
 def stock():
-    sym_raw = request.args.get("symbol", "").strip()
-    if not sym_raw:
+    raw = request.args.get("symbol", "").strip()
+    if not raw:
         return jsonify({"error": "No symbol provided"}), 400
-    symbol = normalise(sym_raw)
+    symbol = normalise(raw)
     base   = symbol.split(".")[0]
 
-    # price & dividend via yfinance
+    # price + trailing 12-month dividend via yfinance
     try:
         tkr   = yf.Ticker(symbol)
         price = float(tkr.fast_info["lastPrice"])
@@ -74,35 +105,35 @@ def stock():
         dividend12 = None
         if not hist.empty:
             hist.index = hist.index.tz_localize(None)
-            cut = datetime.utcnow() - timedelta(days=365)
-            dividend12 = float(hist[hist.index >= cut].sum())
+            cutoff = datetime.utcnow() - timedelta(days=365)
+            dividend12 = float(hist[hist.index >= cutoff].sum())
     except Exception as e:
         return jsonify({"error": f"yfinance error: {e}"}), 500
 
-    franking = read_cache(base) or 42   # default if cache missing
+    franking = read_cache(base) or 42     # default if not cached
     return jsonify({"symbol": symbol, "price": price,
                     "dividend12": dividend12, "franking": franking})
 
+
 @app.route("/refresh_fran")
 def refresh_fran():
-    token  = request.args.get("token", "")
-    symbol = request.args.get("symbol", "").strip().upper()
-    if token != SECRET_TOKEN:
+    if request.args.get("token") != SECRET_TOKEN:
         return jsonify({"error": "Bad token"}), 403
-    if not symbol:
+    base = request.args.get("symbol", "").strip().upper()
+    if not base:
         return jsonify({"error": "Provide ?symbol=CODE"}), 400
-    try:
-        value = scrape_investsmart(symbol)
-        if value is None:
-            return jsonify({"error": "Could not scrape franking"}), 500
-        update_cache(symbol, value)
-        return jsonify({"symbol": symbol, "franking": value})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+
+    value = scrape_investsmart(base)
+    if value is None:
+        return jsonify({"error": "Scrape failed"}), 500
+    update_cache(base, value)
+    return jsonify({"symbol": base, "franking": value})
+
 
 @app.route("/")
 def root():
-    return "Proxy live. Hit /stock or /refresh_fran"
+    return "Proxy live — use /stock and /refresh_fran"
+
 
 # ---------- main ----------
 if __name__ == "__main__":
