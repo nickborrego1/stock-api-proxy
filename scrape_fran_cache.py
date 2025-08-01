@@ -29,7 +29,6 @@ async def scrape_one(page, code: str):
         tds = await tr.query_selector_all("td")
         if len(tds) < 6:
             continue
-        # parse date
         raw = (await tds[5].inner_text()).strip()
         try:
             ex = datetime.strptime(raw, "%d %b %Y").date()
