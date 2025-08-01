@@ -3,5 +3,5 @@ flask-cors
 requests
 beautifulsoup4
 yfinance
-pandas
+pandas   # only because yfinance pulls it in
 gunicorn
