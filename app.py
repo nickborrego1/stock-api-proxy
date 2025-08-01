@@ -1,4 +1,4 @@
-# ---------------------------  app.py  ---------------------------------
+# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests, re, yfinance as yf
@@ -14,17 +14,18 @@ UA = (
 )
 
 # ------------------------------------------------------------------ #
-# Utilities
+# helpers
 # ------------------------------------------------------------------ #
 def normalise(raw: str) -> str:
-    """'vhy'  ->  'VHY.AX'   (keeps suffix if already present)"""
+    """'vhy' -> 'VHY.AX'.  If suffix already supplied, keep it."""
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
 
 def parse_exdate(txt: str):
+    """Try a handful of date formats used on InvestSMART."""
     txt = txt.strip()
-    for fmt in ("%d-%b-%Y", "%d %b %Y", "%d %B %Y", "%d/%m/%Y"):
+    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(txt, fmt).date()
         except ValueError:
@@ -32,91 +33,85 @@ def parse_exdate(txt: str):
     return None
 
 
-# ------------------------------------------------------------------ #
-# Scraper  (MarketIndex  ➜  InvestSMART fallback)
-# ------------------------------------------------------------------ #
-def scrape_marketindex(code: str):
-    """
-    Returns  (total_cash_div_last_12m, weighted_fran_pct)
-    or  (None, None) if nothing could be scraped.
-    """
-
-    def parse_table(html: str):
-        soup = BeautifulSoup(html, "html.parser")
-
-        # locate the first table containing both “amount” and “franking” headers
-        target = None
-        for tbl in soup.find_all("table"):
-            hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-            if {"amount", "franking"}.issubset(hdrs):
-                target = tbl
-                break
-        if target is None:
-            return None, None
-
-        hdrs = [th.get_text(strip=True).lower() for th in target.find_all("th")]
+def clean_amount(cell_text: str) -> float | None:
+    """'$2.43'  → 2.43   |   '61.79¢' → 0.6179"""
+    t = cell_text.strip().replace("$", "")
+    if "¢" in t:
+        t = t.replace("¢", "")
         try:
-            ex_i  = next(i for i, h in enumerate(hdrs) if "ex" in h)
-            amt_i = hdrs.index("amount")
-            fr_i  = hdrs.index("franking")
-        except (StopIteration, ValueError):
-            return None, None
-
-        cutoff = datetime.utcnow().date() - timedelta(days=365)
-        tot_div = tot_fran_cash = 0.0
-
-        for tr in target.find("tbody").find_all("tr"):
-            tds = tr.find_all("td")
-            if len(tds) <= max(ex_i, amt_i, fr_i):
-                continue
-
-            exd = parse_exdate(tds[ex_i].get_text())
-            if not exd or exd < cutoff:
-                continue
-
-            try:
-                amt = float(re.sub(r"[^\d.]", "", tds[amt_i].get_text()))
-            except ValueError:
-                continue
-            try:
-                fr_pc = float(re.sub(r"[^\d.]", "", tds[fr_i].get_text()))
-            except ValueError:
-                fr_pc = 0.0
-
-            tot_div       += amt
-            tot_fran_cash += amt * (fr_pc / 100.0)
-
-        if tot_div == 0:
-            return None, None
-        return round(tot_div, 6), round((tot_fran_cash / tot_div) * 100, 2)
-
-    # ---- 1) MarketIndex ------------------------------------------
-    mi_url = f"https://www.marketindex.com.au/asx/{code.lower()}"
+            return float(t) / 100.0
+        except ValueError:
+            return None
     try:
-        res = requests.get(
-            mi_url,
-            headers={"User-Agent": UA, "Referer": "https://www.google.com/"},
-            timeout=15,
-        )
-        if res.ok:
-            out = parse_table(res.text)
-            if all(out):
-                return out
-        elif res.status_code != 403:
-            print("MarketIndex status:", res.status_code)
-    except Exception as e:
-        print("MarketIndex error:", e)
+        return float(t)
+    except ValueError:
+        return None
 
-    # ---- 2) InvestSMART fallback ---------------------------------
-    is_url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
+
+# ------------------------------------------------------------------ #
+# main scrape  (InvestSMART)
+# ------------------------------------------------------------------ #
+def fetch_dividend_stats(code: str) -> tuple[float | None, float | None]:
+    """
+    Returns (cash_dividend_last_12m, weighted_fran_pct) or (None, None)
+    code: plain ASX code e.g. 'VHY'
+    """
+    url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
+
     try:
-        res = requests.get(is_url, headers={"User-Agent": UA}, timeout=15)
-        if res.ok:
-            return parse_table(res.text)
+        res = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        res.raise_for_status()
     except Exception as e:
-        print("InvestSMART error:", e)
+        print("InvestSMART request error:", e)
+        return None, None
 
-    return None, None
+    soup = BeautifulSoup(res.text, "html.parser")
+    div_tbl = None
+    for tbl in soup.find_all("table"):
+        hdr = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
+        if {"dividend", "franking"}.issubset(hdr):
+            div_tbl = tbl
+            break
+    if div_tbl is None:
+        return None, None
+
+    hdr = [th.get_text(strip=True).lower() for th in div_tbl.find_all("th")]
+    try:
+        ex_i   = next(i for i, h in enumerate(hdr) if "ex" in h and "date" in h)
+        div_i  = hdr.index("dividend")
+        fran_i = hdr.index("franking")
+    except (ValueError, StopIteration):
+        return None, None
+
+    cutoff = datetime.utcnow().date() - timedelta(days=365)
+    tot_div_cash = tot_fran_cash = 0.0
+
+    for tr in div_tbl.find("tbody").find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) <= max(ex_i, div_i, fran_i):
+            continue
+
+        exd = parse_exdate(tds[ex_i].get_text())
+        if not exd or exd < cutoff:
+            continue
+
+        amt = clean_amount(tds[div_i].get_text())
+        if amt is None:
+            continue
+
+        try:
+            fran_pct = float(re.sub(r"[^\d.]", "", tds[fran_i].get_text()))
+        except ValueError:
+            fran_pct = 0.0
+
+        tot_div_cash += amt
+        tot_fran_cash += amt * (fran_pct / 100.0)
+
+    if tot_div_cash == 0:
+        return None, None
+
+    weighted_pct = round((tot_fran_cash / tot_div_cash) * 100, 2)
+    return round(tot_div_cash, 6), weighted_pct
 
 
 # ------------------------------------------------------------------ #
@@ -124,38 +119,36 @@ def scrape_marketindex(code: str):
 # ------------------------------------------------------------------ #
 @app.route("/")
 def home():
-    return "Stock API Proxy – use  /stock?symbol=CODE  (e.g. /stock?symbol=VHY)", 200
+    return "Stock API Proxy – call /stock?symbol=CODE  (e.g. /stock?symbol=VHY)", 200
 
 
 @app.route("/stock")
 def stock():
-    raw = request.args.get("symbol", "").strip()
-    if not raw:
+    raw = request.args.get("symbol", "")
+    if not raw.strip():
         return jsonify(error="No symbol provided"), 400
 
     symbol = normalise(raw)
     base   = symbol.split(".")[0]
 
-    # -------- price (Yahoo) ---------------------------------------
+    # 1) live price --------------------------------------------------
     try:
         price = float(yf.Ticker(symbol).fast_info["lastPrice"])
     except Exception as e:
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
-    # -------- dividends + franking --------------------------------
-    dividend12, franking = scrape_marketindex(base)
+    # 2) dividends & franking ---------------------------------------
+    dividend12, franking = fetch_dividend_stats(base)
 
     return jsonify(
-        symbol=symbol,
-        price=price,
-        dividend12=dividend12,
-        franking=franking,
+        symbol     = symbol,
+        price      = price,
+        dividend12 = dividend12,
+        franking   = franking
     )
 
 
 # ------------------------------------------------------------------ #
-# Run locally
-# ------------------------------------------------------------------ #
 if __name__ == "__main__":
+    # local dev: python app.py
     app.run(host="0.0.0.0", port=8080)
-# ---------------------------  end of file  ---------------------------
