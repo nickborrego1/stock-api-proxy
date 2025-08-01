@@ -1,7 +1,7 @@
 Flask
-requests
 flask-cors
 yfinance
 pandas
+requests
 beautifulsoup4
 gunicorn
