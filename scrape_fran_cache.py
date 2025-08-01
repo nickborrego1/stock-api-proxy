@@ -15,31 +15,32 @@ USER_AGENT  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 # ────────────────────────────────────────────────────────────────
 
 def clean_num(txt: str) -> float:
-    """Strip currency/percent and return float."""
     s = unicodedata.normalize("NFKD", txt)
     s = re.sub(r"[^\d.]", "", s) or "0"
     return float(s)
 
 async def scrape_one(page, code: str) -> float | None:
-    """
-    Scrape InvestSMART dividends page for one code.
-    Returns weighted franking % over last 365 days, or None.
-    """
     url    = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
     cutoff = datetime.utcnow().date() - timedelta(days=365)
     tot_div = tot_frank = 0.0
 
-    # Navigate
     await page.goto(url, timeout=30000)
-    await page.wait_for_load_state("networkidle", timeout=30000)
+    # wait for the table rows to appear in the DOM
+    try:
+        await page.wait_for_selector("table tbody tr", timeout=15000)
+    except:
+        print(f"⚠️ Table rows never appeared for {code}")
+        return None
 
-    # Dismiss cookie banner if present
+    # dismiss cookies banner if it’s still covering the table
     try:
         await page.locator("button:has-text('Accept')").click(timeout=2000)
     except:
         pass
 
     rows = await page.query_selector_all("table tbody tr")
+    print(f"🔍 Found {len(rows)} rows for {code}")
+
     for tr in rows:
         tds = await tr.query_selector_all("td")
         if len(tds) < 6:
@@ -59,7 +60,9 @@ async def scrape_one(page, code: str) -> float | None:
         tot_frank += amt * (frank/100)
 
     if tot_div <= 0:
+        print(f"‼️  No dividends in last 12m for {code}")
         return None
+
     return round((tot_frank / tot_div) * 100, 2)
 
 async def main():
@@ -74,7 +77,7 @@ async def main():
             print(f"→ Scraping {code}…")
             fran = await scrape_one(page, code)
             if fran is None:
-                print(f"‼️  No franking data scraped for {code}")
+                print(f"‼️  Failed to fetch franking for {code}")
             else:
                 print(f"✅  {code}: {fran}%")
                 data[code] = {
