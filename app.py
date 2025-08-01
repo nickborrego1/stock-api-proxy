@@ -9,7 +9,7 @@ app = Flask(__name__)
 CORS(app)
 
 CACHE_FILE = Path("franking_cache.json")
-SECRET_TOKEN = "CHANGE_ME"          # set a simple secret so public users can’t hit /refresh
+SECRET_TOKEN = "mySecret123"          # set a simple secret so public users can’t hit /refresh
 
 # ---------- helpers ----------
 def normalise(raw: str) -> str:
