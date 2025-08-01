@@ -1,80 +1,80 @@
 from flask import Flask, request, jsonify
-import requests, yfinance as yf, pandas as pd, re
-from bs4 import BeautifulSoup
+import yfinance as yf, pandas as pd, re, asyncio
 from datetime import datetime, timedelta
-from dateutil import parser as dtparse           # ← NEW
 from flask_cors import CORS
-import unicodedata
+from playwright.sync_api import sync_playwright, TimeoutError as PlayTimeout
 
 app = Flask(__name__)
 CORS(app)
 
-UA = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36"
-    ),
-    "Referer": "https://www.investsmart.com.au/",
-}
-
+# ---------- helpers ----------
 def normalise(raw: str) -> str:
-    return raw.strip().upper() if "." in raw else f"{raw.strip().upper()}.AX"
+    """Accept 'vhy' or 'vhy.ax' and return 'VHY.AX'."""
+    s = raw.strip().upper()
+    return s if "." in s else f"{s}.AX"
 
-def clean_num(text: str) -> str:
-    """Remove $ , NBSP, and any unicode space so float() works."""
-    txt = unicodedata.normalize("NFKD", text)
-    txt = re.sub(r"[^\d.\-]", "", txt)      # keep digits, dot, minus
-    return txt or "0"
-
-def scrape_investsmart(code: str):
+def scrape_investsmart_playwright(code: str):
+    """
+    Use Playwright headless Chromium to fetch InvestSMART dividends
+    and return list of (ex_date, amount, franking %) within 12 months.
+    """
     url  = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
-    html = requests.get(url, headers=UA, timeout=15).text
-    soup = BeautifulSoup(html, "html.parser")
-    rows = soup.select("table tbody tr")
-    print(f"InvestSMART rows for {code}: {len(rows)}")
-
     cutoff = datetime.utcnow().date() - timedelta(days=365)
     kept   = []
 
-    for tr in rows:
-        tds = tr.find_all("td")
-        if len(tds) < 3:
-            continue
-
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--no-sandbox"])
+        page    = browser.new_page()
         try:
-            ex_date = dtparse.parse(tds[0].get_text(strip=True), dayfirst=True).date()
-        except Exception:
-            continue
+            page.goto(url, timeout=15000)
+            page.wait_for_selector("table tbody tr", timeout=15000)
+        except PlayTimeout:
+            browser.close()
+            return kept
 
-        raw_amt = clean_num(tds[1].get_text(strip=True))
-        raw_fr  = clean_num(tds[2].get_text(strip=True))
+        rows = page.query_selector_all("table tbody tr")
+        for tr in rows:
+            cells = tr.query_selector_all("td")
+            if len(cells) < 3:
+                continue
+            raw_date = cells[0].inner_text().strip()
+            raw_amt  = cells[1].inner_text().strip()
+            raw_fr   = cells[2].inner_text().strip()
 
-        try:
-            amount = float(raw_amt)
-            frank  = float(raw_fr)
-        except ValueError:
-            continue
+            # Clean numeric strings
+            clean_amt = re.sub(r"[^\d.]", "", raw_amt) or "0"
+            clean_fr  = re.sub(r"[^\d.]", "", raw_fr)  or "0"
 
-        if ex_date >= cutoff:
-            kept.append((ex_date, amount, frank))
+            try:
+                ex_date = pd.to_datetime(raw_date, dayfirst=True).date()
+                amt_val = float(clean_amt)
+                fr_val  = float(clean_fr)
+            except Exception:
+                continue
 
-    print(f"Kept {len(kept)} rows for {code} within 12 months")
+            if ex_date >= cutoff:
+                kept.append((ex_date, amt_val, fr_val))
+
+        browser.close()
     return kept
 
+# ---------- route ----------
 @app.route("/stock")
 def stock():
-    raw = request.args.get("symbol","")
+    raw = request.args.get("symbol", "").strip()
     if not raw:
-        return jsonify({"error":"No symbol provided"}),400
+        return jsonify({"error": "No symbol provided"}), 400
 
     symbol = normalise(raw)
     base   = symbol.split(".")[0]
 
+    # ---- price via yfinance ----
     try:
         price = float(yf.Ticker(symbol).fast_info["lastPrice"])
     except Exception as e:
-        return jsonify({"error":f"Price fetch failed: {e}"}),500
+        return jsonify({"error": f"Price fetch failed: {e}"}), 500
 
+    # ---- trailing-12-month dividend via yfinance ----
     dividend12 = None
     try:
         hist = yf.Ticker(symbol).dividends
@@ -85,15 +85,17 @@ def stock():
     except Exception as e:
         print("Dividend error:", e)
 
+    # ---- weighted franking via Playwright scrape ----
     franking = 42
     try:
-        rows = scrape_investsmart(base)
+        rows = scrape_investsmart_playwright(base)
         tot_div = tot_frank = 0
         for _, amt, fr in rows:
             tot_div   += amt
             tot_frank += amt * (fr / 100)
         if tot_div:
             franking = round((tot_frank / tot_div) * 100, 2)
+        print(f"Scraped {len(rows)} rows for {base}; franking = {franking}%")
     except Exception as e:
         print("Franking scrape error:", e)
 
@@ -107,7 +109,9 @@ def stock():
     )
 
 @app.route("/")
-def root(): return "Proxy live"
+def root():
+    return "Proxy live (Playwright)"
 
+# ---------- main ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
