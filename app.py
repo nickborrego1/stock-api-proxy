@@ -1,6 +1,14 @@
+"""
+Stock API Proxy  –  Price + trailing-12M dividends + weighted franking %
+-----------------------------------------------------------------------
+• Price     : Yahoo Finance (yfinance.fast_info["lastPrice"])
+• Dividends : MarketIndex   (primary)   → https://www.marketindex.com.au/asx/<code>
+              InvestSMART   (fallback)  → https://www.investsmart.com.au/shares/asx-<code>/dividends
+"""
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests, re, yfinance as yf, pandas as pd
+import requests, re, yfinance as yf
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 
@@ -12,7 +20,12 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
+# ------------------------------------------------------------------ #
+# helpers
+# ------------------------------------------------------------------ #
+
 def normalise(raw: str) -> str:
+    """'vhy' → 'VHY.AX'   |   'vhy.ax' → 'VHY.AX'"""
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
@@ -25,15 +38,129 @@ def parse_exdate(text: str):
             continue
     return None
 
-def scrape_marketindex(code: str):
-    url = f"https://www.marketindex.com.au/asx/{code.lower()}"
-    try:
-        res = requests.get(url, headers={"User-Agent": UA}, timeout=15)
-        res.raise_for_status()               # ← 8 spaces before “res”
-    except Exception as e:
-        print("MarketIndex request error:", e)
-        return None, None
+# ------------------------------------------------------------------ #
+# main scraper (MarketIndex + fallback InvestSMART)
+# ------------------------------------------------------------------ #
 
+def scrape_marketindex(code: str):
+    """
+    Returns (cash_div_12m, weighted_fran_pct)  or  (None, None).
+    """
+    # ---------- inner helper to parse either site ------------------
+    def parse_table(html: str):
+        soup = BeautifulSoup(html, "html.parser")
+        div_tbl = None
+        for tbl in soup.find_all("table"):
+            hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
+            if {"amount", "franking"}.issubset(set(hdrs)):
+                div_tbl = tbl
+                break
+        if not div_tbl:
+            return None, None
+
+        hdrs = [th.get_text(strip=True).lower() for th in div_tbl.find_all("th")]
+        try:
+            ex_idx  = next(
+                i for i, h in enumerate(hdrs)
+                if "ex" in h and ("date" in h or "dividend" in h)
+            )
+            amt_idx = hdrs.index("amount")
+            frk_idx = hdrs.index("franking")
+        except (StopIteration, ValueError):
+            return None, None
+
+        cutoff = datetime.utcnow().date() - timedelta(days=365)
+        tot_div = tot_frk_cash = 0.0
+
+        for tr in div_tbl.find("tbody").find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) <= max(ex_idx, amt_idx, frk_idx):
+                continue
+            exd = parse_exdate(tds[ex_idx].get_text())
+            if not exd or exd < cutoff:
+                continue
+            try:
+                amt = float(re.sub(r"[^\d.]", "", tds[amt_idx].get_text()))
+            except ValueError:
+                continue
+            try:
+                fpc = float(re.sub(r"[^\d.]", "", tds[frk_idx].get_text()))
+            except ValueError:
+                fpc = 0.0
+            tot_div += amt
+            tot_frk_cash += amt * (fpc / 100.0)
+
+        if tot_div == 0:
+            return None, None
+        return round(tot_div, 6), round((tot_frk_cash / tot_div) * 100, 2)
+
+    # ---------- 1) try MarketIndex --------------------------------
+    mi_url = f"https://www.marketindex.com.au/asx/{code.lower()}"
+    try:
+        res = requests.get(
+            mi_url,
+            headers={
+                "User-Agent": UA,
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.google.com/"
+            },
+            timeout=15,
+        )
+        if res.status_code == 200:
+            out = parse_table(res.text)
+            if all(out):
+                return out
+        elif res.status_code != 403:
+            print("MarketIndex non-200:", res.status_code)
+    except Exception as e:
+        print("MarketIndex error:", e)
+
+    # ---------- 2) fallback InvestSMART ----------------------------
+    is_url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
+    try:
+        res = requests.get(is_url, headers={"User-Agent": UA}, timeout=15)
+        if res.ok:
+            return parse_table(res.text)
+    except Exception as e:
+        print("InvestSMART error:", e)
+
+    return None, None
+
+# ------------------------------------------------------------------ #
+# Flask endpoints
+# ------------------------------------------------------------------ #
+
+@app.route("/")
+def home():
+    return "Stock API Proxy (MarketIndex → InvestSMART fallback). Use /stock?symbol=CODE", 200
+
+@app.route("/stock")
+def stock():
+    raw = request.args.get("symbol", "").strip()
+    if not raw:
+        return jsonify(error="No symbol provided"), 400
+
+    symbol = normalise(raw)
+    base   = symbol.split(".")[0]
+
+    # -------- price ------------------------------------------------
+    try:
+        price = float(yf.Ticker(symbol).fast_info["lastPrice"])
+    except Exception as e:
+        return jsonify(error=f"Price fetch failed: {e}"), 500
+
+    # -------- dividends & franking ---------------------------------
+    dividend12, franking = scrape_marketindex(base)
+
+    return jsonify(
+        symbol=symbol,
+        price=price,
+        dividend12=dividend12,
+        franking=franking
+    )
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
     soup = BeautifulSoup(res.text, "html.parser")
     tables = soup.find_all("table")
     if not tables:
