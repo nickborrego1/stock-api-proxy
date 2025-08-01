@@ -4,7 +4,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from flask_cors import CORS
 
-app = Flask(__name__)                         # <—  must be at top level
+app = Flask(__name__)               #  ← must be top-level
 CORS(app)
 
 UA = {
@@ -17,13 +17,13 @@ UA = {
 
 # ---------- helpers ----------
 def normalise(raw: str) -> str:
-    """'vhy' → 'VHY.AX';  'vhy.ax' stays 'VHY.AX'."""
+    """'vhy' → 'VHY.AX'   'vhy.ax' stays 'VHY.AX'."""
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
 def scrape_investsmart(code: str):
     """
-    Return list of (ex_date, amount, franking%) within last 12 months.
+    Return list of (ex_date, amount, franking%) for the last 12 months.
     """
     url  = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
     html = requests.get(url, headers=UA, timeout=15).text
@@ -33,14 +33,15 @@ def scrape_investsmart(code: str):
 
     cutoff = datetime.utcnow().date() - timedelta(days=365)
     kept   = []
+
     for tr in rows:
         tds = tr.find_all("td")
-        if len(tds) < 5:
+        if len(tds) < 3:            # need at least Ex-Date, Amount, Franking
             continue
 
         raw_date = tds[0].get_text(strip=True)
-        raw_amt  = re.sub(r"[^0-9.]", "", tds[1].get_text(strip=True))  or "0"
-        raw_fr   = re.sub(r"[^0-9.]", "", tds[2].get_text(strip=True))  or "0"
+        raw_amt  = re.sub(r"[^0-9.]", "", tds[1].get_text(strip=True)) or "0"
+        raw_fr   = re.sub(r"[^0-9.]", "", tds[2].get_text(strip=True)) or "0"
 
         try:
             ex_date = pd.to_datetime(raw_date, dayfirst=True).date()
@@ -71,7 +72,7 @@ def stock():
     except Exception as e:
         return jsonify({"error": f"Price fetch failed: {e}"}), 500
 
-    # ---- trailing-12-month dividend ----
+    # ---- trailing-12-month dividend via yfinance ----
     dividend12 = None
     try:
         hist = yf.Ticker(symbol).dividends
@@ -82,7 +83,7 @@ def stock():
     except Exception as e:
         print("Dividend error:", e)
 
-    # ---- weighted franking ----
+    # ---- weighted franking via InvestSMART ----
     franking = 42
     try:
         rows = scrape_investsmart(base)
@@ -97,10 +98,10 @@ def stock():
 
     return jsonify(
         {
-            "symbol"    : symbol,
-            "price"     : price,
+            "symbol": symbol,
+            "price": price,
             "dividend12": dividend12,
-            "franking"  : franking,
+            "franking": franking,
         }
     )
 
