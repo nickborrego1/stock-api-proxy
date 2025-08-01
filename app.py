@@ -13,27 +13,26 @@ USER_AGENT = (
 ASX_JSON_URL = "https://www.asx.com.au/api/markets/trade-our-cash-market/dividend-search"
 
 def normalise(raw: str) -> str:
-    """Turn vhy or VHY.ax → VHY.AX"""
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
 def fetch_franking_asx_json(code: str):
-    """Use ASX’s JSON API to get last 12m dividends."""
+    """Hit ASX’s JSON endpoint correctly with asxCode=CODE."""
     try:
         resp = requests.get(
             ASX_JSON_URL,
-            params={"asxCodes": code},
+            params={"asxCode": code},           # ← singular
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
             timeout=10
         )
         resp.raise_for_status()
-        rows = resp.json().get("rows", [])
+        records = resp.json().get("rows", [])
     except Exception:
         return []
 
     cutoff = datetime.utcnow().date() - timedelta(days=365)
     out = []
-    for r in rows:
+    for r in records:
         try:
             ex = datetime.strptime(r["exDate"], "%d %b %Y").date()
             if ex < cutoff:
@@ -46,7 +45,7 @@ def fetch_franking_asx_json(code: str):
     return out
 
 def fetch_franking_investsmart(code: str):
-    """Fallback: scrape InvestSMART’s HTML table if JSON failed."""
+    """Fallback scrape if ASX JSON returns empty."""
     url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
     try:
         r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
@@ -73,7 +72,7 @@ def fetch_franking_investsmart(code: str):
             amt = float(tds[3].get_text(strip=True).replace("$","").replace(",",""))
             frk = float(tds[4].get_text(strip=True).replace("%",""))
             out.append((ex, amt, frk))
-        except Exception:
+        except:
             continue
     return out
 
@@ -88,32 +87,29 @@ def stock():
         return jsonify({"error":"No symbol provided"}), 400
 
     symbol = normalise(raw)
-    base = symbol.split(".")[0]
+    base   = symbol.split(".")[0]
 
-    # 1) Price fetch (500 if this fails)
+    # 1) Price
     try:
-        tkr = yf.Ticker(symbol)
+        tkr   = yf.Ticker(symbol)
         price = float(tkr.fast_info["lastPrice"])
     except Exception as e:
         return jsonify({"error":f"Price fetch failed: {e}"}), 500
 
-    # 2) Trailing-12m dividends (never 500 on this)
+    # 2) Trailing-12m dividends
     dividend12 = None
     try:
         hist = tkr.dividends
         if not hist.empty:
-            idx = pd.to_datetime(hist.index)
-            # strip tz if present
-            if getattr(idx, "tz", None) is not None:
-                idx = idx.tz_convert(None)
-            idx = idx.tz_localize(None) if getattr(idx, "tz", None) else idx
+            # strip any tz info
+            hist.index = pd.to_datetime(hist.index).tz_localize(None)
             cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
-            mask = idx >= cutoff
+            mask = hist.index >= cutoff
             dividend12 = float(hist.loc[mask].sum())
     except Exception:
         dividend12 = None
 
-    # 3) Franking %: try ASX JSON → fallback to InvestSMART HTML
+    # 3) Weighted franking
     rows = fetch_franking_asx_json(base)
     if not rows:
         rows = fetch_franking_investsmart(base)
