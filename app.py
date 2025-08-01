@@ -8,93 +8,97 @@ from bs4 import BeautifulSoup
 app = Flask(__name__)
 CORS(app)
 
-# ──────────────────────────── Config ────────────────────────────
+# ─────────────────────────── Config ────────────────────────────
 CACHE_FILE   = Path("franking_cache.json")
-SECRET_TOKEN = "mySecret123"      # ← change to your secret
-ASX_URL      = "https://www.asx.com.au/asx/v2/markets/dividends.do"
+SECRET_TOKEN = "mySecret123"        # ← your refresh token
 USER_AGENT   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-# ─────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
 
 def normalise(raw: str) -> str:
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
 def clean_num(txt: str) -> float:
-    # strip non-numeric (including $ , % )
     t = unicodedata.normalize("NFKD", txt)
     t = re.sub(r"[^\d\.]", "", t)
-    return float(t or 0)
+    return float(t or 0.0)
 
-def scrape_asx_fran(symbol_base: str) -> float | None:
+def scrape_investsmart(symbol_base: str) -> float | None:
     """
-    Scrape the ASX static dividends search page:
-    https://www.asx.com.au/asx/v2/markets/dividends.do?by=recent&q=SYMBOL
-    Returns the weighted franking % over the last 365 days or None.
+    Scrape InvestSMART's static dividends page for ASX:<symbol_base>.
+    Returns weighted franking % over last 365 days, or None on failure.
     """
-    params = {"by": "recent", "q": symbol_base}
+    url     = f"https://www.investsmart.com.au/shares/asx-{symbol_base.lower()}/dividends"
+    cutoff  = datetime.utcnow().date() - timedelta(days=365)
+    tot_div = tot_frank = 0.0
+
     headers = {"User-Agent": USER_AGENT}
     try:
-        resp = requests.get(ASX_URL, params=params, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
     except Exception as e:
-        print("ASX page fetch error:", e)
+        print("InvestSMART fetch error:", e)
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
     rows = soup.select("table tbody tr")
-    cutoff = datetime.utcnow().date() - timedelta(days=365)
-    tot_div = tot_frank = 0.0
+    print(f"InvestSMART rows scraped: {len(rows)} for {symbol_base}")
 
     for tr in rows:
         tds = tr.find_all("td")
-        # Expected columns: 0:Sector,1:MarketCap,2:Type,3:Dividend,4:Franking%,5:ExDate,...
+        # expect at least 6 columns: 
+        # [0]=Sector, [1]=MarketCap, [2]=Type, [3]=Dividend, [4]=Franking%, [5]=Ex-date, [6]=Payment date…
         if len(tds) < 6:
             continue
+
         # parse ex-dividend date
+        ex_txt = tds[5].get_text(strip=True)
         try:
-            ex = pd.to_datetime(tds[5].get_text(strip=True), dayfirst=True).date()
-        except Exception:
+            ex_date = pd.to_datetime(ex_txt, dayfirst=True, errors="coerce").date()
+        except:
             continue
-        if ex < cutoff:
+        if not ex_date or ex_date < cutoff:
             continue
 
-        amt   = clean_num(tds[3].get_text(strip=True))
-        frank = clean_num(tds[4].get_text(strip=True))
-        tot_div   += amt
-        tot_frank += amt * (frank / 100)
+        amount = clean_num(tds[3].get_text(strip=True))
+        frank  = clean_num(tds[4].get_text(strip=True))
+        tot_div   += amount
+        tot_frank += amount * (frank / 100)
 
     if tot_div <= 0:
+        print("No dividends in last 12 months for", symbol_base)
         return None
 
-    return round((tot_frank / tot_div) * 100, 2)
+    weighted = round((tot_frank / tot_div) * 100, 2)
+    print(f"Weighted franking for {symbol_base}: {weighted}% on {tot_div} total dividends")
+    return weighted
 
 def read_cache(base: str) -> float | None:
     if not CACHE_FILE.exists():
         return None
     data = json.loads(CACHE_FILE.read_text())
-    entry = data.get(base.upper())
-    return entry.get("franking") if entry else None
+    return data.get(base.upper(), {}).get("franking")
 
 def update_cache(base: str, value: float):
     data = {}
     if CACHE_FILE.exists():
         data = json.loads(CACHE_FILE.read_text())
     data[base.upper()] = {
-        "franking":  value,
+        "franking": value,
         "timestamp": datetime.utcnow().isoformat()
     }
     CACHE_FILE.write_text(json.dumps(data))
 
 @app.route("/stock")
 def stock():
-    raw = request.args.get("symbol", "").strip()
+    raw = request.args.get("symbol","").strip()
     if not raw:
-        return jsonify({"error": "No symbol provided"}), 400
+        return jsonify({"error":"No symbol provided"}), 400
 
     symbol = normalise(raw)
     base   = symbol.split(".")[0]
 
-    # 1) price + trailing 12m dividend via yfinance
+    # 1) Price & trailing-12-month dividend via yfinance
     try:
         tkr   = yf.Ticker(symbol)
         price = float(tkr.fast_info["lastPrice"])
@@ -102,37 +106,37 @@ def stock():
         dividend12 = None
         if not hist.empty:
             hist.index = hist.index.tz_localize(None)
-            cutoff = datetime.utcnow() - timedelta(days=365)
-            dividend12 = float(hist[hist.index >= cutoff].sum())
+            cut = datetime.utcnow() - timedelta(days=365)
+            dividend12 = float(hist[hist.index >= cut].sum())
     except Exception as e:
-        return jsonify({"error": f"yfinance error: {e}"}), 500
+        return jsonify({"error":f"yfinance error: {e}"}), 500
 
-    # 2) franking from cache (or default)
+    # 2) Franking from cache (or default 42%)
     franking = read_cache(base) or 42.0
 
     return jsonify({
-        "symbol": symbol,
-        "price": price,
+        "symbol":    symbol,
+        "price":     price,
         "dividend12": dividend12,
-        "franking": franking
+        "franking":  franking
     })
 
 @app.route("/refresh_fran")
 def refresh_fran():
-    token = request.args.get("token", "")
+    token = request.args.get("token","")
     if token != SECRET_TOKEN:
-        return jsonify({"error": "Bad token"}), 403
+        return jsonify({"error":"Bad token"}), 403
 
-    base = request.args.get("symbol", "").strip().upper()
+    base = request.args.get("symbol","").strip().upper()
     if not base:
-        return jsonify({"error": "Provide ?symbol=CODE"}), 400
+        return jsonify({"error":"Provide ?symbol=CODE"}), 400
 
-    fran = scrape_asx_fran(base)
-    if fran is None:
-        return jsonify({"error": "Scrape failed"}), 500
+    fw = scrape_investsmart(base)
+    if fw is None:
+        return jsonify({"error":"Scrape failed"}), 500
 
-    update_cache(base, fran)
-    return jsonify({"symbol": base, "franking": fran})
+    update_cache(base, fw)
+    return jsonify({"symbol": base, "franking": fw})
 
 @app.route("/")
 def root():
