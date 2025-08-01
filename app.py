@@ -25,7 +25,7 @@ def clean_num(txt: str) -> float:
 
 def scrape_investsmart(symbol_base: str) -> float | None:
     """
-    Scrape InvestSMART's static dividends page for ASX:<symbol_base>.
+    Scrape InvestSMART's static dividends page.
     Returns weighted franking % over last 365 days, or None on failure.
     """
     url     = f"https://www.investsmart.com.au/shares/asx-{symbol_base.lower()}/dividends"
@@ -46,18 +46,17 @@ def scrape_investsmart(symbol_base: str) -> float | None:
 
     for tr in rows:
         tds = tr.find_all("td")
-        # expect at least 6 columns: 
-        # [0]=Sector, [1]=MarketCap, [2]=Type, [3]=Dividend, [4]=Franking%, [5]=Ex-date, [6]=Payment date…
+        # Expect at least 6 columns: [3]=Dividend, [4]=Franking%, [5]=Ex-date
         if len(tds) < 6:
             continue
 
-        # parse ex-dividend date
-        ex_txt = tds[5].get_text(strip=True)
-        try:
-            ex_date = pd.to_datetime(ex_txt, dayfirst=True, errors="coerce").date()
-        except:
+        # parse ex-dividend date safely
+        raw_ex = tds[5].get_text(strip=True)
+        parsed = pd.to_datetime(raw_ex, dayfirst=True, errors="coerce")
+        if pd.isna(parsed):
             continue
-        if not ex_date or ex_date < cutoff:
+        ex_date = parsed.date()
+        if ex_date < cutoff:
             continue
 
         amount = clean_num(tds[3].get_text(strip=True))
@@ -70,21 +69,22 @@ def scrape_investsmart(symbol_base: str) -> float | None:
         return None
 
     weighted = round((tot_frank / tot_div) * 100, 2)
-    print(f"Weighted franking for {symbol_base}: {weighted}% on {tot_div} total dividends")
+    print(f"Weighted franking for {symbol_base}: {weighted}%")
     return weighted
 
 def read_cache(base: str) -> float | None:
     if not CACHE_FILE.exists():
         return None
-    data = json.loads(CACHE_FILE.read_text())
-    return data.get(base.upper(), {}).get("franking")
+    data  = json.loads(CACHE_FILE.read_text())
+    entry = data.get(base.upper(), {})
+    return entry.get("franking")
 
 def update_cache(base: str, value: float):
     data = {}
     if CACHE_FILE.exists():
         data = json.loads(CACHE_FILE.read_text())
     data[base.upper()] = {
-        "franking": value,
+        "franking":  value,
         "timestamp": datetime.utcnow().isoformat()
     }
     CACHE_FILE.write_text(json.dumps(data))
@@ -98,7 +98,7 @@ def stock():
     symbol = normalise(raw)
     base   = symbol.split(".")[0]
 
-    # 1) Price & trailing-12-month dividend via yfinance
+    # price & trailing-12m dividends via yfinance
     try:
         tkr   = yf.Ticker(symbol)
         price = float(tkr.fast_info["lastPrice"])
@@ -106,19 +106,17 @@ def stock():
         dividend12 = None
         if not hist.empty:
             hist.index = hist.index.tz_localize(None)
-            cut = datetime.utcnow() - timedelta(days=365)
-            dividend12 = float(hist[hist.index >= cut].sum())
+            cutoff = datetime.utcnow() - timedelta(days=365)
+            dividend12 = float(hist[hist.index >= cutoff].sum())
     except Exception as e:
         return jsonify({"error":f"yfinance error: {e}"}), 500
 
-    # 2) Franking from cache (or default 42%)
     franking = read_cache(base) or 42.0
-
     return jsonify({
-        "symbol":    symbol,
-        "price":     price,
+        "symbol":     symbol,
+        "price":      price,
         "dividend12": dividend12,
-        "franking":  franking
+        "franking":   franking
     })
 
 @app.route("/refresh_fran")
