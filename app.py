@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 import yfinance as yf
+import pandas as pd
 from flask_cors import CORS
 
 app = Flask(__name__)
