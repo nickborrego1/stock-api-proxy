@@ -34,16 +34,22 @@ def parse_exdate(txt: str):
 
 
 def clean_amount(cell_text: str) -> float | None:
-    """'$2.43'  → 2.43   |   '61.79¢' → 0.6179"""
-    t = cell_text.strip().replace("$", "")
-    if "¢" in t:
-        t = t.replace("¢", "")
+    """
+    '$2.43'  -> 2.43
+    '61.79¢' -> 0.6179
+    '104c'   -> 1.04
+    '104 Cents' -> 1.04
+    """
+    txt = cell_text.strip().lower().replace("$", "").replace("cents", "").strip()
+    # cents?
+    if txt.endswith(("c", "¢")):
+        txt = txt.rstrip("c¢").strip()
         try:
-            return float(t) / 100.0
+            return float(txt) / 100.0
         except ValueError:
             return None
     try:
-        return float(t)
+        return float(txt)
     except ValueError:
         return None
 
