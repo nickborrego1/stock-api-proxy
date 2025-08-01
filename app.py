@@ -3,34 +3,33 @@ import json, re, unicodedata, yfinance as yf, pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask_cors import CORS
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 app = Flask(__name__)
 CORS(app)
 
-# ────────────────────────────── CONFIG ──────────────────────────────
+# ─────────────── Configuration ───────────────
 CACHE_FILE   = Path("franking_cache.json")
-SECRET_TOKEN = "mySecret123"          # <-- change if you like
-BROWSER_ARGS = ["--no-sandbox"]       # required on Render free tier
-NET_TIMEOUT  = 30_000                 # 30 s (ms) for slow first loads
-# ────────────────────────────────────────────────────────────────────
+SECRET_TOKEN = "mySecret123"          # ← your secret token
+BROWSER_ARGS = ["--no-sandbox"]
+NET_TIMEOUT  = 30_000                 # ms for networkidle & selector waits
+# ───────────────────────────────────────────────
 
 
-# ---------- helpers ----------
 def normalise(raw: str) -> str:
-    """'vhy' → 'VHY.AX';  'vhy.ax' remains 'VHY.AX'."""
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
 def clean_num(txt: str) -> float:
-    """Remove $, commas, NBSP, etc.  Return 0.0 on blanks."""
-    cleaned = re.sub(r"[^\d.]", "", unicodedata.normalize("NFKD", txt)) or "0"
-    return float(cleaned)
+    s = unicodedata.normalize("NFKD", txt)
+    s = re.sub(r"[^\d.]", "", s) or "0"
+    return float(s)
 
 def scrape_investsmart(symbol_base: str) -> float | None:
     """
-    Headless Chromium scrape via Playwright.
-    Returns weighted franking % for last-365-days, or None on failure.
+    Use Playwright to headlessly load InvestSMART dividends page,
+    then parse Ex-Date | Amount | Franking % for the last 365 days.
+    Returns weighted franking % or None on failure.
     """
     url = f"https://www.investsmart.com.au/shares/asx-{symbol_base.lower()}/dividends"
     cutoff = datetime.utcnow().date() - timedelta(days=365)
@@ -39,65 +38,80 @@ def scrape_investsmart(symbol_base: str) -> float | None:
     with sync_playwright() as p:
         browser = p.chromium.launch(args=BROWSER_ARGS)
         page    = browser.new_page()
+
         try:
             page.goto(url, timeout=NET_TIMEOUT)
-            # wait until no network requests for 0.5 s (React finished)
             page.wait_for_load_state("networkidle", timeout=NET_TIMEOUT)
-        except Exception:
+        except PlaywrightTimeout:
             browser.close()
+            print("Timeout waiting for networkidle")
             return None
 
-        # dismiss cookie banner if present
+        # Dismiss cookie banner if it shows up
         try:
             page.locator("button:has-text('Accept')").click(timeout=2_000)
         except Exception:
             pass
 
+        # Now wait specifically for the table rows to appear
+        try:
+            page.wait_for_selector("table tbody tr", timeout=NET_TIMEOUT)
+        except PlaywrightTimeout:
+            print("Timeout waiting for table rows")
+
         rows = page.query_selector_all("table tbody tr")
+        print(f"InvestSMART scraped rows: {len(rows)} for {symbol_base}")
+
         for tr in rows:
             tds = tr.query_selector_all("td")
             if len(tds) < 3:
                 continue
-            ex_date = pd.to_datetime(tds[0].inner_text().strip(),
-                                     dayfirst=True, errors="coerce").date()
+
+            # Parse the ex-dividend date
+            ex_str = tds[0].inner_text().strip()
+            ex_date = pd.to_datetime(ex_str, dayfirst=True, errors="coerce").date()
             if not ex_date or ex_date < cutoff:
                 continue
-            amount = clean_num(tds[1].inner_text())
-            frank  = clean_num(tds[2].inner_text())
-            tot_div   += amount
-            tot_frank += amount * (frank / 100)
+
+            amt = clean_num(tds[1].inner_text())
+            fr  = clean_num(tds[2].inner_text())
+            tot_div   += amt
+            tot_frank += amt * (fr / 100)
 
         browser.close()
 
-    return round((tot_frank / tot_div) * 100, 2) if tot_div else None
+    if tot_div == 0:
+        return None
+    weighted = round((tot_frank / tot_div) * 100, 2)
+    print(f"Weighted franking for {symbol_base}: {weighted}% based on {tot_div} dividend")
+    return weighted
 
 
-# ---------- cache helpers ----------
 def read_cache(base: str) -> float | None:
     if not CACHE_FILE.exists():
         return None
-    entry = json.loads(CACHE_FILE.read_text()).get(base.upper())
-    return entry.get("franking") if entry else None
+    data = json.loads(CACHE_FILE.read_text())
+    entry = data.get(base.upper())
+    return entry and entry.get("franking")
 
 def update_cache(base: str, value: float):
     data = {}
     if CACHE_FILE.exists():
         data = json.loads(CACHE_FILE.read_text())
-    data[base.upper()] = {"franking": value,
-                          "timestamp": datetime.utcnow().isoformat()}
+    data[base.upper()] = {"franking": value, "timestamp": datetime.utcnow().isoformat()}
     CACHE_FILE.write_text(json.dumps(data))
 
 
-# ---------- routes ----------
 @app.route("/stock")
 def stock():
-    raw = request.args.get("symbol", "").strip()
+    raw = request.args.get("symbol","").strip()
     if not raw:
-        return jsonify({"error": "No symbol provided"}), 400
+        return jsonify({"error":"No symbol provided"}),400
+
     symbol = normalise(raw)
     base   = symbol.split(".")[0]
 
-    # price + trailing 12-month dividend via yfinance
+    # Get price & trailing 12-month dividend
     try:
         tkr   = yf.Ticker(symbol)
         price = float(tkr.fast_info["lastPrice"])
@@ -105,29 +119,34 @@ def stock():
         dividend12 = None
         if not hist.empty:
             hist.index = hist.index.tz_localize(None)
-            cutoff = datetime.utcnow() - timedelta(days=365)
-            dividend12 = float(hist[hist.index >= cutoff].sum())
+            cut = datetime.utcnow() - timedelta(days=365)
+            dividend12 = float(hist[hist.index >= cut].sum())
     except Exception as e:
-        return jsonify({"error": f"yfinance error: {e}"}), 500
+        return jsonify({"error":f"yfinance error: {e}"}),500
 
-    franking = read_cache(base) or 42     # default if not cached
-    return jsonify({"symbol": symbol, "price": price,
-                    "dividend12": dividend12, "franking": franking})
+    franking = read_cache(base) or 42
+    return jsonify({
+        "symbol": symbol,
+        "price": price,
+        "dividend12": dividend12,
+        "franking": franking
+    })
 
 
 @app.route("/refresh_fran")
 def refresh_fran():
     if request.args.get("token") != SECRET_TOKEN:
-        return jsonify({"error": "Bad token"}), 403
-    base = request.args.get("symbol", "").strip().upper()
+        return jsonify({"error":"Bad token"}), 403
+    base = request.args.get("symbol","").strip().upper()
     if not base:
-        return jsonify({"error": "Provide ?symbol=CODE"}), 400
+        return jsonify({"error":"Provide ?symbol=CODE"}),400
 
-    value = scrape_investsmart(base)
-    if value is None:
-        return jsonify({"error": "Scrape failed"}), 500
-    update_cache(base, value)
-    return jsonify({"symbol": base, "franking": value})
+    fw = scrape_investsmart(base)
+    if fw is None:
+        return jsonify({"error":"Scrape failed"}), 500
+
+    update_cache(base, fw)
+    return jsonify({"symbol": base, "franking": fw})
 
 
 @app.route("/")
@@ -135,6 +154,5 @@ def root():
     return "Proxy live — use /stock and /refresh_fran"
 
 
-# ---------- main ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
