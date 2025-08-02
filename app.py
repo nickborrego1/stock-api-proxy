@@ -2,8 +2,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests, re, yfinance as yf
 from bs4 import BeautifulSoup
-from datetime import datetime, date, timedelta
-from dateutil import parser as dtparser
+from datetime import datetime, date
+from dateutil import parser as dtparser         # flexible date fallback
 
 app = Flask(__name__)
 CORS(app)
@@ -13,10 +13,11 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
-# ---------------- helpers ----------------
+# ---------- helpers ---------------------------------------------------------
 def normalise(raw: str) -> str:
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
+
 
 def parse_exdate(txt: str):
     txt = txt.replace("\xa0", " ").strip()
@@ -29,6 +30,7 @@ def parse_exdate(txt: str):
         return dtparser.parse(txt, dayfirst=True).date()
     except Exception:
         return None
+
 
 def clean_amount(cell_text: str) -> float | None:
     t = (cell_text.replace("\xa0", "")
@@ -46,13 +48,15 @@ def clean_amount(cell_text: str) -> float | None:
     except ValueError:
         return None
 
+
 def previous_fy_bounds(today: date | None = None):
     if today is None:
         today = datetime.utcnow().date()
     start_year = today.year - 1 if today.month >= 7 else today.year - 2
     return date(start_year, 7, 1), date(start_year + 1, 6, 30)
 
-# ---------------- scraper ----------------
+
+# ---------- scraper ---------------------------------------------------------
 def fetch_dividend_stats(code: str):
     url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
     try:
@@ -103,10 +107,12 @@ def fetch_dividend_stats(code: str):
         return None, None
     return round(tot_div, 6), round(tot_fran_cash / tot_div * 100, 2)
 
-# ---------------- Flask ------------------
+
+# ---------- Flask endpoints --------------------------------------------------
 @app.route("/")
 def home():
     return "Stock API Proxy – /stock?symbol=CODE", 200
+
 
 @app.route("/stock")
 def stock():
@@ -115,15 +121,4 @@ def stock():
         return jsonify(error="No symbol provided"), 400
 
     symbol = normalise(raw)
-    base   = symbol.split(".")[0]
-
-    try:
-        price = float(yf.Ticker(symbol).fast_info["lastPrice"])
-    except Exception as e:
-        return jsonify(error=f"Price fetch failed: {e}"), 500
-
-    div12, fran = fetch_dividend_stats(base)
-    return jsonify(symbol=symbol, price=price, dividend12=div12, franking=fran)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    base   = symbol.sp
