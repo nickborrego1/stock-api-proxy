@@ -1,8 +1,9 @@
-# app.py — ASX dividend proxy (InvestSMART, pagination-aware & FY-correct)
+# app.py — ASX dividend proxy (InvestSMART, pagination-aware, FY-correct)
 from __future__ import annotations
 
 from datetime import date, datetime
 from urllib.parse import urlparse, parse_qsl, urlencode
+from typing import Optional
 
 import re
 import requests
@@ -17,7 +18,7 @@ CORS(app)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0 Safari/537.36")
-ROWS_PER_PAGE = 250  # InvestSMART lets us choose up to 250 rows
+ROWS_PER_PAGE = 250
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -26,13 +27,13 @@ def normalise(raw: str) -> str:
     return s if "." in s else f"{s}.AX"
 
 
-def previous_fy_bounds(today: date | None = None) -> tuple[date, date]:
+def previous_fy_bounds(today: Optional[date] = None) -> tuple[date, date]:
     today = today or datetime.utcnow().date()
     start_year = today.year - 1 if today.month >= 7 else today.year - 2
     return date(start_year, 7, 1), date(start_year + 1, 6, 30)
 
 
-def parse_exdate(txt: str) -> date | None:
+def parse_exdate(txt: str) -> Optional[date]:
     txt = (
         txt.replace("\u00a0", " ")
            .replace("\u2011", "-")
@@ -53,7 +54,7 @@ def parse_exdate(txt: str) -> date | None:
         return None
 
 
-def _parse_num_with_units(num: str, cents_hint: bool) -> float | None:
+def _parse_num(num: str, cents_hint: bool) -> Optional[float]:
     try:
         val = float(num)
         return val / 100.0 if cents_hint else val
@@ -61,27 +62,18 @@ def _parse_num_with_units(num: str, cents_hint: bool) -> float | None:
         return None
 
 
-def clean_amount_cell(td: Tag) -> float | None:
-    """
-    Return dividend per share in dollars.
-
-    • First try visible text (what used to work).
-    • If that’s a placeholder (e.g. “HFResult”), scan the HTML for the first
-      number token and decide whether it’s cents or dollars by context.
-    """
+def clean_amount_cell(td: Tag) -> Optional[float]:
     txt = td.get_text(" ", strip=True)
-    amt = _parse_num_with_units(txt.lower().replace("$", ""), "c" in txt.lower())
-
+    amt = _parse_num(txt.lower().replace("$", ""), "c" in txt.lower())
     if amt is not None:
         return amt
 
-    # Fallback – search raw HTML for a number (handles JS-filled cells)
     html = td.decode_contents()
     m = re.search(r"(\d+(?:\.\d+)?)\s*(cpu|c|¢)?", html, flags=re.I)
     if not m:
         return None
     num, unit = m.group(1), (m.group(2) or "").lower()
-    return _parse_num_with_units(num, unit in ("cpu", "c", "¢"))
+    return _parse_num(num, unit in ("cpu", "c", "¢"))
 
 
 # ───────────────────── scraping core ──────────────────────
@@ -90,17 +82,26 @@ def wanted_table(tbl) -> bool:
     return "ex" in hdr and "dividend" in hdr and "date" in hdr
 
 
-def header_index(headers: list[str], *needles: str) -> int | None:
+def header_index(headers: list[str], *needles: str) -> Optional[int]:
+    """
+    Prefer exact header match; fall back to first header *containing* a needle.
+    """
     needles = [n.lower() for n in needles]
-    for i, h in enumerate(headers):
-        if any(n in h for n in needles):
-            return i
+
+    for n in needles:                        # exact
+        for i, h in enumerate(headers):
+            if h.strip() == n:
+                return i
+
+    for n in needles:                        # substring
+        for i, h in enumerate(headers):
+            if n in h:
+                return i
     return None
 
 
-def rows_in_dividend_tables(soup: BeautifulSoup) -> int:
-    return sum(len(t.find_all("tr")) - 1
-               for t in soup.find_all("table") if wanted_table(t))
+def rows_in_tables(soup: BeautifulSoup) -> int:
+    return sum(len(t.find_all("tr")) - 1 for t in soup.find_all("table") if wanted_table(t))
 
 
 def get_all_pages(start_url: str) -> list[BeautifulSoup]:
@@ -120,7 +121,7 @@ def get_all_pages(start_url: str) -> list[BeautifulSoup]:
         soup = BeautifulSoup(r.text, "html.parser")
         soups.append(soup)
 
-        if rows_in_dividend_tables(soup) < ROWS_PER_PAGE:
+        if rows_in_tables(soup) < ROWS_PER_PAGE:
             break
         page += 1
     return soups
@@ -145,14 +146,10 @@ def fetch_dividend_stats(code: str, debug: bool = False):
             if ex_i is None or div_i is None:
                 continue
 
-            trs = tbl.find_all("tr")[1:]
-            for tr in trs:
+            for tr in tbl.find_all("tr")[1:]:
                 tds = tr.find_all(["td", "th"])
-                if len(tds) <= max(ex_i, div_i, (fran_i or 0)):
-                    # defensive pad
-                    tds += [BeautifulSoup("<td></td>", "html.parser")] * (
-                        max(ex_i, div_i, (fran_i or 0)) - len(tds) + 1
-                    )
+                while len(tds) <= max(ex_i, div_i, (fran_i or 0)):
+                    tds.append(BeautifulSoup("<td></td>", "html.parser"))
 
                 exd = parse_exdate(tds[ex_i].get_text(" ", strip=True))
                 amt = clean_amount_cell(tds[div_i])
@@ -215,10 +212,12 @@ def stock():
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
     dividend12, franking = fetch_dividend_stats(base)
-    return jsonify(symbol=symbol,
-                   price=price,
-                   dividend12=dividend12,
-                   franking=franking), 200
+    return jsonify(
+        symbol=symbol,
+        price=price,
+        dividend12=dividend12,
+        franking=franking
+    ), 200
 
 
 if __name__ == "__main__":
