@@ -5,3 +5,4 @@ beautifulsoup4
 yfinance
 pandas   # only because yfinance pulls it in
 gunicorn
+python-dateutil>=2.9
