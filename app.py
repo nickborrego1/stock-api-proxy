@@ -121,5 +121,20 @@ def stock():
         return jsonify(error="No symbol provided"), 400
 
     symbol = normalise(raw)
-    base   = symbol.split(".")[0]          # correct – 4 spaces
- # keep everything before the dot
+    base   = symbol.split(".")[0]
+
+    # 1) live price --------------------------------------------------
+    try:
+        price = float(yf.Ticker(symbol).fast_info["lastPrice"])
+    except Exception as e:
+        return jsonify(error=f"Price fetch failed: {e}"), 500
+
+    # 2) dividends & franking ---------------------------------------
+    dividend12, franking = fetch_dividend_stats(base)
+
+    return jsonify(
+        symbol     = symbol,
+        price      = price,
+        dividend12 = dividend12,
+        franking   = franking
+    )
