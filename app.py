@@ -1,18 +1,24 @@
+# app.py — ASX dividend + franking API (FY-aware)
+
 from __future__ import annotations
+from datetime import datetime, date
+from typing import Optional
+from urllib.parse import urljoin
+
+import re, requests, pandas as pd, yfinance as yf
+from bs4 import BeautifulSoup
+from dateutil import parser as dtparser
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests, re, yfinance as yf
-from bs4 import BeautifulSoup, Tag
-from datetime import datetime, date
-from dateutil import parser as dtparser
-from urllib.parse import urljoin
 
 app = Flask(__name__)
 CORS(app)
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-ROWS_PER_PAGE = 250  # max InvestSMART allows
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+ROWS_PER_PAGE = 250  # InvestSMART max
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -21,16 +27,17 @@ def normalise(raw: str) -> str:
     return s if "." in s else f"{s}.AX"
 
 
-def previous_fy_bounds(today: date | None = None) -> tuple[date, date]:
+def last_completed_fy_bounds(today: Optional[date] = None) -> tuple[date, date]:
+    """Return start/end of the *last finished* Australian FY."""
     today = today or datetime.utcnow().date()
-    start_year = today.year - 1 if today.month >= 7 else today.year - 2
-    return date(start_year, 7, 1), date(start_year + 1, 6, 30)
+    # If we’re before 1 Jul, the finished FY is two years back
+    fy_end_year = today.year if today.month < 7 else today.year - 1
+    return date(fy_end_year - 1, 7, 1), date(fy_end_year, 6, 30)
 
 
-def parse_exdate(txt: str) -> date | None:
-    txt = txt.replace("\xa0", " ").strip()          # squash &nbsp;
-    for fmt in ("%d %b %Y", "%d %b %y", "%d %B %Y",
-                "%d-%b-%Y", "%d/%m/%Y"):
+def parse_exdate(txt: str) -> Optional[date]:
+    txt = txt.replace("\xa0", " ").strip()
+    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d/%m/%Y", "%d %b %y"):
         try:
             return datetime.strptime(txt, fmt).date()
         except ValueError:
@@ -41,47 +48,32 @@ def parse_exdate(txt: str) -> date | None:
         return None
 
 
-def clean_amount(cell_text: str) -> float | None:
-    t = (cell_text.replace("\xa0", "")
-                  .replace(" ", "")
-                  .replace("$", "")
-                  .strip())
-    if t.lower().endswith(("c", "¢")):
-        t = t[:-1]
-        try:
-            return float(t) / 100.0
-        except ValueError:
-            return None
+def extract_float(txt: str) -> Optional[float]:
     try:
-        return float(t)
+        return float(re.sub(r"[^\d.]", "", txt))
     except ValueError:
         return None
 
 
-# ───────────────────── scraping core ──────────────────────
+# ───────────────────────── scraping ────────────────────────
 def wanted_table(tbl) -> bool:
     hdr = " ".join(th.get_text(strip=True).lower() for th in tbl.find_all("th"))
-    return "dividend" in hdr and "franking" in hdr and "ex" in hdr
+    return all(key in hdr for key in ("ex", "dividend", "franking"))
 
 
-def header_index(headers: list[str], *needles: str) -> int | None:
-    needles = [n.lower() for n in needles]
-    # exact match first
-    for n in needles:
-        for i, h in enumerate(headers):
-            if h.strip() == n:
-                return i
-    # substring fallback
-    for n in needles:
-        for i, h in enumerate(headers):
-            if n in h:
-                return i
+def header_idx(headers: list[str], name: str) -> int | None:
+    name = name.lower()
+    for i, h in enumerate(headers):
+        if h.strip() == name:
+            return i
+    for i, h in enumerate(headers):
+        if name in h:
+            return i
     return None
 
 
-def get_all_pages(start_url: str) -> list[BeautifulSoup]:
-    """Follow ‘next’ pagination links until exhausted."""
-    soups, next_url = [], start_url
+def all_pages(url: str) -> list[BeautifulSoup]:
+    soups, next_url = [], url
     sess = requests.Session()
     sess.headers["User-Agent"] = UA
 
@@ -91,89 +83,99 @@ def get_all_pages(start_url: str) -> list[BeautifulSoup]:
         soups.append(soup)
 
         nxt_li = soup.find("li", class_=lambda c: c and "next" in c.lower())
-        nxt_a  = nxt_li.a if nxt_li and nxt_li.a else soup.find("a", rel="next")
-        next_url = urljoin(start_url, nxt_a["href"]) if nxt_a and nxt_a.get("href") else None
-
+        nxt_a = nxt_li.a if nxt_li and nxt_li.a else soup.find("a", rel="next")
+        next_url = urljoin(url, nxt_a["href"]) if nxt_a and nxt_a.get("href") else None
     return soups
 
 
-def fetch_dividend_stats(code: str) -> tuple[float | None, float | None]:
-    base_url = (f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
-                f"?size={ROWS_PER_PAGE}&OrderBy=6&OrderByOrientation=Descending")
-    soups = get_all_pages(base_url)
+def franking_by_date(code: str, fy_start: date, fy_end: date) -> dict[date, float]:
+    """Return {ex-date: franking %} for the FY from InvestSMART pages."""
+    base = (
+        f"https://www.investsmart.com.au/shares/asx-{code}/dividends"
+        f"?size={ROWS_PER_PAGE}&OrderBy=6&OrderByOrientation=Descending"
+    )
+    result: dict[date, float] = {}
 
-    fy_start, fy_end = previous_fy_bounds()
-    cash = fran_cash = 0.0
-
-    for soup in soups:
+    for soup in all_pages(base):
         for tbl in (t for t in soup.find_all("table") if wanted_table(t)):
             hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-            ex_i   = header_index(hdrs, "ex")
-            div_i  = header_index(hdrs, "dividend", "amount")
-            fran_i = header_index(hdrs, "franking")
-            dist_i = header_index(hdrs, "distribution")  # first variable-width col
-
-            if None in (ex_i, div_i, fran_i):
+            ex_i = header_idx(hdrs, "ex")
+            fran_i = header_idx(hdrs, "franking")
+            dist_i = header_idx(hdrs, "distribution")  # where variable width begins
+            if ex_i is None or fran_i is None:
                 continue
 
             for tr in tbl.find("tbody").find_all("tr"):
-                tds = tr.find_all(["td", "th"])
+                tds = tr.find_all("td")
                 if not tds:
                     continue
+
                 shift = len(tds) - len(hdrs)
 
                 def adj(idx: int) -> int:
                     return idx + shift if shift and dist_i is not None and idx > dist_i else idx
 
-                if adj(ex_i) >= len(tds) or adj(div_i) >= len(tds):
-                    continue
-
                 exd = parse_exdate(tds[adj(ex_i)].get_text())
                 if not exd or not (fy_start <= exd <= fy_end):
                     continue
 
-                amt = clean_amount(tds[adj(div_i)].get_text())
-                if amt is None:
-                    continue
+                fr_pct = extract_float(tds[adj(fran_i)].get_text()) or 0.0
+                result[exd] = fr_pct
+    return result
 
-                try:
-                    fr_pct = float(re.sub(r"[^\d.]", "", tds[adj(fran_i)].get_text()))
-                except ValueError:
-                    fr_pct = 0.0
 
-                cash      += amt
-                fran_cash += amt * (fr_pct / 100.0)
+# ───────────────────────── finance calc ────────────────────
+def fy_dividends_yf(symbol: str, fy_start: date, fy_end: date) -> pd.Series:
+    """Return Series indexed by date with cash amounts inside the FY."""
+    s = yf.Ticker(symbol).dividends
+    if s.empty:
+        return pd.Series(dtype=float)
+    s.index = s.index.date
+    return s.loc[(s.index >= fy_start) & (s.index <= fy_end)]
 
-    if cash == 0:
+
+def combined_stats(symbol: str) -> tuple[float | None, float | None]:
+    fy_start, fy_end = last_completed_fy_bounds()
+
+    # 1) cash from Yahoo Finance
+    cash_series = fy_dividends_yf(symbol, fy_start, fy_end)
+    if cash_series.empty:
         return None, None
-    return round(cash, 6), round(fran_cash / cash * 100, 2)
+    cash_total = cash_series.sum()
+
+    # 2) franking % from InvestSMART
+    fr_dict = franking_by_date(symbol.split(".")[0].lower(), fy_start, fy_end)
+
+    frank_cash = 0.0
+    for exd, amt in cash_series.items():
+        pct = fr_dict.get(exd, 0.0)
+        frank_cash += amt * (pct / 100)
+
+    frank_pct = 0 if cash_total == 0 else round(frank_cash / cash_total * 100, 2)
+    return round(cash_total, 6), frank_pct
 
 
-# ────────────────────── Flask layer ───────────────────────
-@app.route("/")
-def home():
-    return "Stock API Proxy – /stock?symbol=CODE  (e.g. /stock?symbol=VHY)", 200
-
-
+# ───────────────────────── API layer ───────────────────────
 @app.route("/stock")
 def stock():
     raw = request.args.get("symbol", "")
     if not raw.strip():
-        return jsonify(error="No symbol provided"), 400
+        return jsonify(error="no symbol"), 400
 
     symbol = normalise(raw)
-    base   = symbol.split(".")[0]
 
     try:
         price = float(yf.Ticker(symbol).fast_info["lastPrice"])
     except Exception as e:
-        return jsonify(error=f"Price fetch failed: {e}"), 500
+        return jsonify(error=f"price fetch failed: {e}"), 500
 
-    dividend, franking = fetch_dividend_stats(base)
-    return jsonify(symbol=symbol,
-                   price=price,
-                   dividend12=dividend,
-                   franking=franking)
+    div12, frank_pct = combined_stats(symbol)
+    return jsonify(
+        symbol=symbol,
+        price=price,
+        dividend12=div12,
+        franking=frank_pct,
+    )
 
 
 if __name__ == "__main__":
