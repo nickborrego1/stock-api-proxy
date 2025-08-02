@@ -1,16 +1,21 @@
-# app.py — ASX dividend + franking API (FY-aware)
+# app.py — ASX dividend proxy (InvestSMART, pagination-proof)
 
 from __future__ import annotations
-from datetime import datetime, date
-from typing import Optional
+
+import re
+from datetime import date, datetime
 from urllib.parse import urljoin
 
-import re, requests, pandas as pd, yfinance as yf
+import requests
+import yfinance as yf
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+# ------------------------------------------------------------------ #
+# Flask setup
+# ------------------------------------------------------------------ #
 app = Flask(__name__)
 CORS(app)
 
@@ -18,26 +23,42 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
-ROWS_PER_PAGE = 250  # InvestSMART max
+
+# ------------------------------------------------------------------ #
+# Helpers
+# ------------------------------------------------------------------ #
 
 
-# ───────────────────────── helpers ─────────────────────────
 def normalise(raw: str) -> str:
+    """Translate e.g. 'vhy' → 'VHY.AX'."""
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
 
-def last_completed_fy_bounds(today: Optional[date] = None) -> tuple[date, date]:
-    """Return start/end of the *last finished* Australian FY."""
+def last_completed_fy_bounds(today: date | None = None) -> tuple[date, date]:
+    """
+    Return the *completed* Australian FY (1 Jul → 30 Jun) that has most
+    recently ended.
+
+    e.g.  2 Aug 2025 → (2024-07-01, 2025-06-30)
+    """
     today = today or datetime.utcnow().date()
-    # If we’re before 1 Jul, the finished FY is two years back
-    fy_end_year = today.year if today.month < 7 else today.year - 1
-    return date(fy_end_year - 1, 7, 1), date(fy_end_year, 6, 30)
+    end_year = today.year if today.month < 7 else today.year - 1
+    start_year = end_year - 1
+    return date(start_year, 7, 1), date(end_year, 6, 30)
 
 
-def parse_exdate(txt: str) -> Optional[date]:
-    txt = txt.replace("\xa0", " ").strip()
-    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d/%m/%Y", "%d %b %y"):
+def parse_exdate(txt: str) -> date | None:
+    """Robust date reader – accepts most formats InvestSMART emits."""
+    txt = (
+        txt.replace("\u00a0", " ")
+        .replace("\u2011", "-")
+        .replace("\u2012", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .strip()
+    )
+    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d-%b-%y", "%d/%m/%Y", "%d %b %y"):
         try:
             return datetime.strptime(txt, fmt).date()
         except ValueError:
@@ -48,135 +69,178 @@ def parse_exdate(txt: str) -> Optional[date]:
         return None
 
 
-def extract_float(txt: str) -> Optional[float]:
+_WS_RE = re.compile(r"\s+")
+
+
+def clean_amount(cell: str) -> float | None:
+    """
+    Return the cash value per share in dollars.
+
+    Accepts '$1.04', '77.4¢', '32.83 cent', etc.
+    """
+    t = (
+        _WS_RE.sub("", cell)  # collapse all whitespace incl. NB-space
+        .replace("$", "")
+        .replace(",", "")
+        .lower()
+    )
+    for suf in ("cpu", "c", "¢", "cent", "cents"):
+        if t.endswith(suf):
+            try:
+                return float(t[: -len(suf)]) / 100.0
+            except ValueError:
+                return None
     try:
-        return float(re.sub(r"[^\d.]", "", txt))
+        return float(t)
     except ValueError:
         return None
 
 
-# ───────────────────────── scraping ────────────────────────
-def wanted_table(tbl) -> bool:
-    hdr = " ".join(th.get_text(strip=True).lower() for th in tbl.find_all("th"))
-    return all(key in hdr for key in ("ex", "dividend", "franking"))
+# ------------------------------------------------------------------ #
+# Scraping core
+# ------------------------------------------------------------------ #
 
 
-def header_idx(headers: list[str], name: str) -> int | None:
-    name = name.lower()
-    for i, h in enumerate(headers):
-        if h.strip() == name:
-            return i
-    for i, h in enumerate(headers):
-        if name in h:
-            return i
-    return None
-
-
-def all_pages(url: str) -> list[BeautifulSoup]:
-    soups, next_url = [], url
-    sess = requests.Session()
-    sess.headers["User-Agent"] = UA
-
+def get_all_pages(start_url: str) -> list[BeautifulSoup]:
+    """Follow » pagination links and return BeautifulSoup for every page."""
+    soups: list[BeautifulSoup] = []
+    next_url: str | None = start_url
     while next_url:
-        html = sess.get(next_url, timeout=15).text
+        html = requests.get(next_url, headers={"User-Agent": UA}, timeout=20).text
         soup = BeautifulSoup(html, "html.parser")
         soups.append(soup)
 
-        nxt_li = soup.find("li", class_=lambda c: c and "next" in c.lower())
-        nxt_a = nxt_li.a if nxt_li and nxt_li.a else soup.find("a", rel="next")
-        next_url = urljoin(url, nxt_a["href"]) if nxt_a and nxt_a.get("href") else None
+        nxt = soup.select_one(".pagination a:contains('»')")
+        next_url = urljoin(start_url, nxt["href"]) if nxt else None
     return soups
 
 
-def franking_by_date(code: str, fy_start: date, fy_end: date) -> dict[date, float]:
-    """Return {ex-date: franking %} for the FY from InvestSMART pages."""
-    base = (
-        f"https://www.investsmart.com.au/shares/asx-{code}/dividends"
-        f"?size={ROWS_PER_PAGE}&OrderBy=6&OrderByOrientation=Descending"
+def row_stats(tr) -> tuple[date, float, float] | None:
+    """
+    Extract (ex-date, cash dividend $, franking %) from a <tr>.
+    The function is robust to random blank/br cells.
+    """
+    cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+    if not cells:
+        return None
+
+    # 1) locate the ex-dividend date cell
+    ex_idx = None
+    exd = None
+    for i, txt in enumerate(cells):
+        d = parse_exdate(txt)
+        if d:
+            ex_idx, exd = i, d
+            break
+    if ex_idx is None:
+        return None
+
+    # 2) franking % = first cell *before* ex-date that contains a '%'
+    fran_pct = 0.0
+    fran_idx = None
+    for i in range(ex_idx - 1, -1, -1):
+        if "%" in cells[i]:
+            try:
+                fran_pct = float(re.sub(r"[^\d.]", "", cells[i]))
+                fran_idx = i
+            except ValueError:
+                pass
+            break
+
+    # 3) cash amount = first parsable amount *before* franking%
+    for j in range((fran_idx or ex_idx) - 1, -1, -1):
+        amt = clean_amount(cells[j])
+        if amt is not None:
+            return exd, amt, fran_pct
+    return None
+
+
+def fetch_dividend_stats(code: str, debug: bool = False):
+    """
+    Total cash & weighted franking for the *last completed* FY.
+
+    Returns (tuple: cash, franking%) or (None, None) if no rows.
+    """
+    base_url = (
+        f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
+        f"?size=250&OrderBy=6&OrderByOrientation=Descending"
     )
-    result: dict[date, float] = {}
 
-    for soup in all_pages(base):
-        for tbl in (t for t in soup.find_all("table") if wanted_table(t)):
-            hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-            ex_i = header_idx(hdrs, "ex")
-            fran_i = header_idx(hdrs, "franking")
-            dist_i = header_idx(hdrs, "distribution")  # where variable width begins
-            if ex_i is None or fran_i is None:
-                continue
-
-            for tr in tbl.find("tbody").find_all("tr"):
-                tds = tr.find_all("td")
-                if not tds:
-                    continue
-
-                shift = len(tds) - len(hdrs)
-
-                def adj(idx: int) -> int:
-                    return idx + shift if shift and dist_i is not None and idx > dist_i else idx
-
-                exd = parse_exdate(tds[adj(ex_i)].get_text())
-                if not exd or not (fy_start <= exd <= fy_end):
-                    continue
-
-                fr_pct = extract_float(tds[adj(fran_i)].get_text()) or 0.0
-                result[exd] = fr_pct
-    return result
-
-
-# ───────────────────────── finance calc ────────────────────
-def fy_dividends_yf(symbol: str, fy_start: date, fy_end: date) -> pd.Series:
-    """Return Series indexed by date with cash amounts inside the FY."""
-    s = yf.Ticker(symbol).dividends
-    if s.empty:
-        return pd.Series(dtype=float)
-    s.index = s.index.date
-    return s.loc[(s.index >= fy_start) & (s.index <= fy_end)]
-
-
-def combined_stats(symbol: str) -> tuple[float | None, float | None]:
     fy_start, fy_end = last_completed_fy_bounds()
+    tot_div_cash = tot_fran_cash = 0.0
+    dbg_rows = []
 
-    # 1) cash from Yahoo Finance
-    cash_series = fy_dividends_yf(symbol, fy_start, fy_end)
-    if cash_series.empty:
+    for soup in get_all_pages(base_url):
+        for tr in soup.select("table tbody tr"):
+            stats = row_stats(tr)
+            if not stats:
+                continue
+            exd, amt, fran_pct = stats
+            inside = fy_start <= exd <= fy_end
+            if inside:
+                tot_div_cash += amt
+                tot_fran_cash += amt * (fran_pct / 100.0)
+
+            if debug:
+                dbg_rows.append(
+                    {
+                        "ex": exd.isoformat(),
+                        "amt": amt,
+                        "fran%": fran_pct,
+                        "inside": inside,
+                    }
+                )
+
+    if debug:
+        return {
+            "fy": f"{fy_start}→{fy_end}",
+            "total_dividend": round(tot_div_cash, 6),
+            "weighted_fran%": 0
+            if tot_div_cash == 0
+            else round(tot_fran_cash / tot_div_cash * 100, 2),
+            "rows": dbg_rows,
+        }
+
+    if tot_div_cash == 0:
         return None, None
-    cash_total = cash_series.sum()
-
-    # 2) franking % from InvestSMART
-    fr_dict = franking_by_date(symbol.split(".")[0].lower(), fy_start, fy_end)
-
-    frank_cash = 0.0
-    for exd, amt in cash_series.items():
-        pct = fr_dict.get(exd, 0.0)
-        frank_cash += amt * (pct / 100)
-
-    frank_pct = 0 if cash_total == 0 else round(frank_cash / cash_total * 100, 2)
-    return round(cash_total, 6), frank_pct
+    return round(tot_div_cash, 6), round((tot_fran_cash / tot_div_cash) * 100, 2)
 
 
-# ───────────────────────── API layer ───────────────────────
+# ------------------------------------------------------------------ #
+# Flask routes
+# ------------------------------------------------------------------ #
+@app.route("/")
+def home():
+    return (
+        "Stock API Proxy – call /stock?symbol=<CODE>  (e.g. /stock?symbol=VHY)",
+        200,
+    )
+
+
 @app.route("/stock")
 def stock():
     raw = request.args.get("symbol", "")
     if not raw.strip():
-        return jsonify(error="no symbol"), 400
+        return jsonify(error="No symbol provided"), 400
 
     symbol = normalise(raw)
+    base = symbol.split(".")[0]
 
+    # Live price ---------------------------------------------------------
     try:
         price = float(yf.Ticker(symbol).fast_info["lastPrice"])
     except Exception as e:
-        return jsonify(error=f"price fetch failed: {e}"), 500
+        return jsonify(error=f"Price fetch failed: {e}"), 500
 
-    div12, frank_pct = combined_stats(symbol)
-    return jsonify(
-        symbol=symbol,
-        price=price,
-        dividend12=div12,
-        franking=frank_pct,
-    )
+    # Dividends ----------------------------------------------------------
+    if "debug" in request.args:
+        return jsonify(fetch_dividend_stats(base, debug=True)), 200
+
+    cash_div, franking = fetch_dividend_stats(base)
+    return jsonify(symbol=symbol, price=price, dividend12=cash_div, franking=franking)
 
 
+# ------------------------------------------------------------------ #
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # Local dev:  python app.py
+    app.run(host="0.0.0.0", port=8080, debug=False)
