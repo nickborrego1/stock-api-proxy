@@ -12,7 +12,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 
-# -------- helpers -----------------------------------------------------------
+# ---------- helpers ---------------------------------------------------------
 def normalise(raw: str) -> str:
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
@@ -26,7 +26,7 @@ def previous_fy_bounds(today: date | None = None) -> tuple[date, date]:
 
 def parse_exdate(txt: str):
     txt = txt.replace("\xa0", " ").strip()
-    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d/%m/%Y"):
+    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d/%m/%Y", "%d %b %y"):
         try:
             return datetime.strptime(txt, fmt).date()
         except ValueError:
@@ -38,7 +38,7 @@ def parse_exdate(txt: str):
 
 
 def clean_amount(cell: str) -> float | None:
-    t = (cell.replace("\xa0", "").replace(" ", "").replace("$", "").strip())
+    t = cell.replace("\xa0", "").replace(" ", "").replace("$", "").strip()
     if t.lower().endswith(("c", "¢")):
         try:
             return float(t[:-1]) / 100.0
@@ -50,8 +50,8 @@ def clean_amount(cell: str) -> float | None:
         return None
 
 
-# -------- main scrape -------------------------------------------------------
-def _locate_div_table(soup: BeautifulSoup):
+# ---------- scrape ----------------------------------------------------------
+def locate_div_table(soup: BeautifulSoup):
     for tbl in soup.find_all("table"):
         hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
         if any(("dividend" in h or "amount" in h) for h in hdrs) and "franking" in hdrs:
@@ -59,7 +59,7 @@ def _locate_div_table(soup: BeautifulSoup):
     return None
 
 
-def _col_idx(headers: list[str], *keys: str) -> int | None:
+def col_idx(headers: list[str], *keys: str) -> int | None:
     for k in keys:
         for i, h in enumerate(headers):
             if k in h:
@@ -75,35 +75,42 @@ def fetch_dividend_stats(code: str) -> tuple[float | None, float | None]:
         return None, None
 
     soup = BeautifulSoup(html, "html.parser")
-    tbl = _locate_div_table(soup)
+    tbl = locate_div_table(soup)
     if not tbl:
         return None, None
 
     hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-    ex_i = _col_idx(hdrs, "ex")
-    div_i = _col_idx(hdrs, "dividend", "amount")
-    fran_i = _col_idx(hdrs, "franking")
+    ex_i   = col_idx(hdrs, "ex")
+    div_i  = col_idx(hdrs, "dividend", "amount")
+    fran_i = col_idx(hdrs, "franking")
     if None in (ex_i, div_i, fran_i):
         return None, None
 
     fy_start, fy_end = previous_fy_bounds()
     tot_cash = tot_fran_cash = 0.0
 
-    for tr in tbl.find("tbody").find_all("tr"):
+    for tr in tbl.find_all("tr")[1:]:                # skip header row
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-        if len(cells) <= max(ex_i, div_i, fran_i):
+
+        # pad out short rows (colspan)
+        while len(cells) <= max(ex_i, div_i, fran_i):
+            cells.append("")
+
+        try:
+            ex_raw, amt_raw, frac_raw = cells[ex_i], cells[div_i], cells[fran_i]
+        except IndexError:
             continue
 
-        exd = parse_exdate(cells[ex_i])
+        exd = parse_exdate(ex_raw)
         if not exd or not (fy_start <= exd <= fy_end):
             continue
 
-        amt = clean_amount(cells[div_i])
+        amt = clean_amount(amt_raw)
         if amt is None:
             continue
 
         try:
-            fr_pct = float(re.sub(r"[^\d.]", "", cells[fran_i]))
+            fr_pct = float(re.sub(r"[^\d.]", "", frac_raw))
         except ValueError:
             fr_pct = 0.0
 
@@ -115,7 +122,7 @@ def fetch_dividend_stats(code: str) -> tuple[float | None, float | None]:
     return round(tot_cash, 6), round(tot_fran_cash / tot_cash * 100, 2)
 
 
-# -------- optional debug ----------------------------------------------------
+# ---------- debug helper ----------------------------------------------------
 def fetch_dividend_stats_debug(code: str):
     fy_start, fy_end = previous_fy_bounds()
     cash = fran = 0.0
@@ -123,24 +130,25 @@ def fetch_dividend_stats_debug(code: str):
 
     url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
     soup = BeautifulSoup(requests.get(url, headers={"User-Agent": UA}, timeout=15).text, "html.parser")
-    tbl = _locate_div_table(soup)
+    tbl = locate_div_table(soup)
     if not tbl:
         return {"error": "table not found"}
 
     hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-    ex_i = _col_idx(hdrs, "ex")
-    div_i = _col_idx(hdrs, "dividend", "amount")
-    fran_i = _col_idx(hdrs, "franking")
+    ex_i   = col_idx(hdrs, "ex")
+    div_i  = col_idx(hdrs, "dividend", "amount")
+    fran_i = col_idx(hdrs, "franking")
 
     for tr in tbl.find_all("tr")[1:]:
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-        if len(cells) <= max(ex_i, div_i, fran_i):
-            continue
-        ex_raw, amt_raw = cells[ex_i], cells[div_i]
+        while len(cells) <= max(ex_i, div_i, fran_i):
+            cells.append("")
+
+        ex_raw, amt_raw, frac_raw = cells[ex_i], cells[div_i], cells[fran_i]
 
         exd = parse_exdate(ex_raw)
         amt = clean_amount(amt_raw)
-        fpc = float(re.sub(r"[^\d.]", "", cells[fran_i] or "0") or 0)
+        fpc = float(re.sub(r"[^\d.]", "", frac_raw or "0") or 0)
 
         inside = all([exd, amt]) and fy_start <= exd <= fy_end
         if inside:
@@ -154,7 +162,7 @@ def fetch_dividend_stats_debug(code: str):
     return {"tot_cash": round(cash, 6), "tot_fran": tot_fran, "rows": rows}
 
 
-# -------- Flask routes ------------------------------------------------------
+# ---------- Flask -----------------------------------------------------------
 @app.route("/")
 def home():
     return "Stock API Proxy – /stock?symbol=CODE", 200
@@ -167,7 +175,7 @@ def stock():
         return jsonify(error="No symbol provided"), 400
 
     symbol = normalise(raw)
-    base = symbol.split(".")[0]
+    base   = symbol.split(".")[0]
 
     # debug path
     if request.args.get("debug"):
