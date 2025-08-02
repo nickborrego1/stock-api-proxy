@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from urllib.parse import urljoin, urlparse, parse_qsl, urlencode
+from urllib.parse import urlparse, parse_qsl, urlencode
 
 import re
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from dateutil import parser as dtparser
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -20,7 +20,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 ROWS_PER_PAGE = 250  # InvestSMART lets us choose up to 250 rows
 
 
-# ────────────────────────────────── helpers ──────────────────────────────────
+# ───────────────────────── helpers ─────────────────────────
 def normalise(raw: str) -> str:
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
@@ -53,28 +53,38 @@ def parse_exdate(txt: str) -> date | None:
         return None
 
 
-def clean_amount(cell: str) -> float | None:
-    t = (
-        cell.replace("\u00a0", "")
-            .replace(" ", "")
-            .replace("$", "")
-            .replace(",", "")
-            .strip()
-            .lower()
-    )
-    for suf in ("cpu", "c", "¢"):
-        if t.endswith(suf):
-            try:
-                return float(t[:-len(suf)]) / 100.0
-            except ValueError:
-                return None
+def _parse_num_with_units(num: str, cents_hint: bool) -> float | None:
     try:
-        return float(t)
+        val = float(num)
+        return val / 100.0 if cents_hint else val
     except ValueError:
         return None
 
 
-# ────────────────────────────── scraping core ───────────────────────────────
+def clean_amount_cell(td: Tag) -> float | None:
+    """
+    Return dividend per share in dollars.
+
+    • First try visible text (what used to work).
+    • If that’s a placeholder (e.g. “HFResult”), scan the HTML for the first
+      number token and decide whether it’s cents or dollars by context.
+    """
+    txt = td.get_text(" ", strip=True)
+    amt = _parse_num_with_units(txt.lower().replace("$", ""), "c" in txt.lower())
+
+    if amt is not None:
+        return amt
+
+    # Fallback – search raw HTML for a number (handles JS-filled cells)
+    html = td.decode_contents()
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(cpu|c|¢)?", html, flags=re.I)
+    if not m:
+        return None
+    num, unit = m.group(1), (m.group(2) or "").lower()
+    return _parse_num_with_units(num, unit in ("cpu", "c", "¢"))
+
+
+# ───────────────────── scraping core ──────────────────────
 def wanted_table(tbl) -> bool:
     hdr = " ".join(th.get_text(strip=True).lower() for th in tbl.find_all("th"))
     return "ex" in hdr and "dividend" in hdr and "date" in hdr
@@ -83,9 +93,8 @@ def wanted_table(tbl) -> bool:
 def header_index(headers: list[str], *needles: str) -> int | None:
     needles = [n.lower() for n in needles]
     for i, h in enumerate(headers):
-        for n in needles:
-            if n in h:
-                return i
+        if any(n in h for n in needles):
+            return i
     return None
 
 
@@ -95,28 +104,25 @@ def rows_in_dividend_tables(soup: BeautifulSoup) -> int:
 
 
 def get_all_pages(start_url: str) -> list[BeautifulSoup]:
-    soups = []
+    soups, page = [], 1
     session = requests.Session()
     session.headers.update({"User-Agent": UA})
 
-    page = 1
     while True:
-        url_parts = urlparse(start_url)
-        qs = dict(parse_qsl(url_parts.query))
-        qs["page"] = str(page)
-        url = url_parts._replace(query=urlencode(qs, doseq=True)).geturl()
+        u = urlparse(start_url)
+        q = dict(parse_qsl(u.query))
+        q["page"] = str(page)
+        url = u._replace(query=urlencode(q, doseq=True)).geturl()
 
-        resp = session.get(url, timeout=15)
-        if resp.status_code != 200:
+        r = session.get(url, timeout=15)
+        if r.status_code != 200:
             break
-
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(r.text, "html.parser")
         soups.append(soup)
 
         if rows_in_dividend_tables(soup) < ROWS_PER_PAGE:
             break
         page += 1
-
     return soups
 
 
@@ -126,7 +132,7 @@ def fetch_dividend_stats(code: str, debug: bool = False):
     soups = get_all_pages(base_url)
 
     fy_start, fy_end = previous_fy_bounds()
-    cash, franked_cash = 0.0, 0.0
+    cash = franked_cash = 0.0
     dbg_rows = []
 
     for soup in soups:
@@ -139,15 +145,21 @@ def fetch_dividend_stats(code: str, debug: bool = False):
             if ex_i is None or div_i is None:
                 continue
 
-            for tr in tbl.find_all("tr")[1:]:
-                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-                while len(cells) <= max(ex_i, div_i, (fran_i or 0)):
-                    cells.append("")
+            trs = tbl.find_all("tr")[1:]
+            for tr in trs:
+                tds = tr.find_all(["td", "th"])
+                if len(tds) <= max(ex_i, div_i, (fran_i or 0)):
+                    # defensive pad
+                    tds += [BeautifulSoup("<td></td>", "html.parser")] * (
+                        max(ex_i, div_i, (fran_i or 0)) - len(tds) + 1
+                    )
 
-                exd = parse_exdate(cells[ex_i])
-                amt = clean_amount(cells[div_i])
+                exd = parse_exdate(tds[ex_i].get_text(" ", strip=True))
+                amt = clean_amount_cell(tds[div_i])
+
+                fran_txt = tds[fran_i].get_text(" ", strip=True) if fran_i is not None else ""
                 try:
-                    fr_pct = float(re.sub(r"[^\d.]", "", cells[fran_i])) if fran_i is not None else 0.0
+                    fr_pct = float(re.sub(r"[^\d.]", "", fran_txt)) if fran_txt else 0.0
                 except ValueError:
                     fr_pct = 0.0
 
@@ -158,9 +170,9 @@ def fetch_dividend_stats(code: str, debug: bool = False):
 
                 if debug:
                     dbg_rows.append({
-                        "ex": cells[ex_i],
+                        "ex": tds[ex_i].get_text(" ", strip=True),
                         "parsed": str(exd),
-                        "amt": cells[div_i],
+                        "amt": tds[div_i].get_text(" ", strip=True),
                         "amt_ok": amt is not None,
                         "fran%": fr_pct,
                         "in_FY": inside,
@@ -179,7 +191,7 @@ def fetch_dividend_stats(code: str, debug: bool = False):
     )
 
 
-# ────────────────────────────── Flask layer ────────────────────────────────
+# ────────────────────── Flask layer ───────────────────────
 @app.route("/")
 def home():
     return "Stock API Proxy – /stock?symbol=CODE", 200
@@ -203,12 +215,10 @@ def stock():
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
     dividend12, franking = fetch_dividend_stats(base)
-    return jsonify(
-        symbol=symbol,
-        price=price,
-        dividend12=dividend12,
-        franking=franking
-    ), 200
+    return jsonify(symbol=symbol,
+                   price=price,
+                   dividend12=dividend12,
+                   franking=franking), 200
 
 
 if __name__ == "__main__":
