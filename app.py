@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from urllib.parse import urlparse, parse_qsl, urlencode
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode
 from typing import Optional
 
 import re
@@ -16,9 +16,9 @@ import yfinance as yf
 app = Flask(__name__)
 CORS(app)
 
-UA           = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0 Safari/537.36")
-ROWS_PER_PAGE = 250    # maximum the site allows
+UA            = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0 Safari/537.36")
+ROWS_PER_PAGE = 250
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -59,16 +59,11 @@ def _parse_num(num: str, cents_hint: bool) -> Optional[float]:
 
 
 def clean_amount_cell(td: Tag) -> Optional[float]:
-    """
-    Robustly extract the dividend cash amount from a <td>.
-    Handles $-prefixed dollars, ¢, ‘cpu’, stray&nbsp;s, etc.
-    """
     txt = td.get_text(" ", strip=True)
     amt = _parse_num(txt.lower().replace("$", ""), "c" in txt.lower())
     if amt is not None:
         return amt
 
-    # Fallback: search raw HTML
     html = td.decode_contents()
     m = re.search(r"(\d+(?:\.\d+)?)\s*(cpu|c|¢)?", html, flags=re.I)
     if not m:
@@ -86,13 +81,13 @@ def wanted_table(tbl) -> bool:
 def header_index(headers: list[str], *needles: str) -> Optional[int]:
     needles = [n.lower() for n in needles]
 
-    # 1. exact match
+    # exact first
     for n in needles:
         for i, h in enumerate(headers):
             if h.strip() == n:
                 return i
 
-    # 2. substring fallback
+    # substring fallback
     for n in needles:
         for i, h in enumerate(headers):
             if n in h:
@@ -100,31 +95,20 @@ def header_index(headers: list[str], *needles: str) -> Optional[int]:
     return None
 
 
-def rows_in_tables(soup: BeautifulSoup) -> int:
-    return sum(len(t.find_all("tr")) - 1
-               for t in soup.find_all("table") if wanted_table(t))
-
-
 def get_all_pages(start_url: str) -> list[BeautifulSoup]:
-    soups, page = [], 1
+    """Follow the ‘»’ pagination link until exhausted."""
+    soups, next_url = [], start_url
     session = requests.Session()
     session.headers.update({"User-Agent": UA})
 
-    while True:
-        u = urlparse(start_url)
-        q = dict(parse_qsl(u.query))
-        q["page"] = str(page)
-        url = u._replace(query=urlencode(q, doseq=True)).geturl()
-
-        r = session.get(url, timeout=15)
-        if r.status_code != 200:
-            break
-        soup = BeautifulSoup(r.text, "html.parser")
+    while next_url:
+        html = session.get(next_url, timeout=15).text
+        soup = BeautifulSoup(html, "html.parser")
         soups.append(soup)
 
-        if rows_in_tables(soup) < ROWS_PER_PAGE:
-            break
-        page += 1
+        nxt = soup.select_one(".pagination a:contains('»'), .pagination a[rel='next']")
+        next_url = urljoin(start_url, nxt["href"]) if nxt and nxt.get("href") else None
+
     return soups
 
 
@@ -143,27 +127,19 @@ def fetch_dividend_stats(code: str, debug: bool = False):
             ex_i   = header_index(hdrs, "ex")
             div_i  = header_index(hdrs, "dividend")
             fran_i = header_index(hdrs, "franking")
-            dist_i = header_index(hdrs, "distribution") or 2  # used for offset logic
 
             if ex_i is None or div_i is None:
                 continue
 
             for tr in tbl.find_all("tr")[1:]:
                 tds = tr.find_all(["td", "th"])
-                # Adjust for rows where 'Distribution Type' is split into extra <td>s
-                shift = max(0, len(tds) - len(hdrs))
-                def adj(idx: int) -> int:
-                    return idx + shift if shift and idx > dist_i else idx
+                while len(tds) <= max(ex_i, div_i, (fran_i or 0)):
+                    tds.append(BeautifulSoup("<td></td>", "html.parser"))
 
-                try:
-                    exd = parse_exdate(tds[adj(ex_i)].get_text(" ", strip=True))
-                except IndexError:
-                    exd = None
+                exd = parse_exdate(tds[ex_i].get_text(" ", strip=True))
+                amt = clean_amount_cell(tds[div_i])
 
-                amt = clean_amount_cell(tds[adj(div_i)]) if len(tds) > adj(div_i) else None
-
-                fran_txt = (tds[adj(fran_i)].get_text(" ", strip=True)
-                            if fran_i is not None and len(tds) > adj(fran_i) else "")
+                fran_txt = tds[fran_i].get_text(" ", strip=True) if fran_i is not None else ""
                 try:
                     fr_pct = float(re.sub(r"[^\d.]", "", fran_txt)) if fran_txt else 0.0
                 except ValueError:
@@ -176,9 +152,9 @@ def fetch_dividend_stats(code: str, debug: bool = False):
 
                 if debug:
                     dbg_rows.append({
-                        "ex": tds[adj(ex_i)].get_text(" ", strip=True) if len(tds) > adj(ex_i) else "",
+                        "ex": tds[ex_i].get_text(" ", strip=True),
                         "parsed": str(exd),
-                        "amt": tds[adj(div_i)].get_text(" ", strip=True) if len(tds) > adj(div_i) else "",
+                        "amt": tds[div_i].get_text(" ", strip=True),
                         "amt_ok": amt is not None,
                         "fran%": fr_pct,
                         "in_FY": inside,
