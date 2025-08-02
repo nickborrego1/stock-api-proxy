@@ -121,4 +121,4 @@ def stock():
         return jsonify(error="No symbol provided"), 400
 
     symbol = normalise(raw)
-    base   = symbol.sp
+base   = symbol.split(".")[0]   # keep everything before the dot
