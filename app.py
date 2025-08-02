@@ -51,12 +51,9 @@ def clean_amount(cell: str) -> float | None:
 
 
 # ---------- scrape ----------------------------------------------------------
-def locate_div_table(soup: BeautifulSoup):
-    for tbl in soup.find_all("table"):
-        hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-        if any(("dividend" in h or "amount" in h) for h in hdrs) and "franking" in hdrs:
-            return tbl
-    return None
+def wanted_table(tbl) -> bool:
+    hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
+    return any(("dividend" in h or "amount" in h) for h in hdrs) and "franking" in hdrs
 
 
 def col_idx(headers: list[str], *keys: str) -> int | None:
@@ -75,47 +72,41 @@ def fetch_dividend_stats(code: str) -> tuple[float | None, float | None]:
         return None, None
 
     soup = BeautifulSoup(html, "html.parser")
-    tbl = locate_div_table(soup)
-    if not tbl:
-        return None, None
-
-    hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-    ex_i   = col_idx(hdrs, "ex")
-    div_i  = col_idx(hdrs, "dividend", "amount")
-    fran_i = col_idx(hdrs, "franking")
-    if None in (ex_i, div_i, fran_i):
+    tables = [t for t in soup.find_all("table") if wanted_table(t)]
+    if not tables:
         return None, None
 
     fy_start, fy_end = previous_fy_bounds()
     tot_cash = tot_fran_cash = 0.0
 
-    for tr in tbl.find_all("tr")[1:]:                # skip header row
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-
-        # pad out short rows (colspan)
-        while len(cells) <= max(ex_i, div_i, fran_i):
-            cells.append("")
-
-        try:
-            ex_raw, amt_raw, frac_raw = cells[ex_i], cells[div_i], cells[fran_i]
-        except IndexError:
+    for tbl in tables:                           # <-- iterate *all* tables
+        hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
+        ex_i   = col_idx(hdrs, "ex")
+        div_i  = col_idx(hdrs, "dividend", "amount")
+        fran_i = col_idx(hdrs, "franking")
+        if None in (ex_i, div_i, fran_i):
             continue
 
-        exd = parse_exdate(ex_raw)
-        if not exd or not (fy_start <= exd <= fy_end):
-            continue
+        for tr in tbl.find_all("tr")[1:]:
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            while len(cells) <= max(ex_i, div_i, fran_i):
+                cells.append("")
 
-        amt = clean_amount(amt_raw)
-        if amt is None:
-            continue
+            exd = parse_exdate(cells[ex_i])
+            if not exd or not (fy_start <= exd <= fy_end):
+                continue
 
-        try:
-            fr_pct = float(re.sub(r"[^\d.]", "", frac_raw))
-        except ValueError:
-            fr_pct = 0.0
+            amt = clean_amount(cells[div_i])
+            if amt is None:
+                continue
 
-        tot_cash += amt
-        tot_fran_cash += amt * (fr_pct / 100.0)
+            try:
+                fr_pct = float(re.sub(r"[^\d.]", "", cells[fran_i]))
+            except ValueError:
+                fr_pct = 0.0
+
+            tot_cash += amt
+            tot_fran_cash += amt * (fr_pct / 100.0)
 
     if tot_cash == 0:
         return None, None
@@ -130,33 +121,31 @@ def fetch_dividend_stats_debug(code: str):
 
     url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
     soup = BeautifulSoup(requests.get(url, headers={"User-Agent": UA}, timeout=15).text, "html.parser")
-    tbl = locate_div_table(soup)
-    if not tbl:
-        return {"error": "table not found"}
+    tables = [t for t in soup.find_all("table") if wanted_table(t)]
 
-    hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-    ex_i   = col_idx(hdrs, "ex")
-    div_i  = col_idx(hdrs, "dividend", "amount")
-    fran_i = col_idx(hdrs, "franking")
+    for tbl in tables:
+        hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
+        ex_i   = col_idx(hdrs, "ex")
+        div_i  = col_idx(hdrs, "dividend", "amount")
+        fran_i = col_idx(hdrs, "franking")
 
-    for tr in tbl.find_all("tr")[1:]:
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-        while len(cells) <= max(ex_i, div_i, fran_i):
-            cells.append("")
+        for tr in tbl.find_all("tr")[1:]:
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            while len(cells) <= max(ex_i, div_i, fran_i):
+                cells.append("")
 
-        ex_raw, amt_raw, frac_raw = cells[ex_i], cells[div_i], cells[fran_i]
+            ex_raw, amt_raw, frac_raw = cells[ex_i], cells[div_i], cells[fran_i]
+            exd = parse_exdate(ex_raw)
+            amt = clean_amount(amt_raw)
+            fpc = float(re.sub(r"[^\d.]", "", frac_raw or "0") or 0)
 
-        exd = parse_exdate(ex_raw)
-        amt = clean_amount(amt_raw)
-        fpc = float(re.sub(r"[^\d.]", "", frac_raw or "0") or 0)
+            inside = all([exd, amt]) and fy_start <= exd <= fy_end
+            if inside:
+                cash += amt
+                fran += amt * (fpc / 100.0)
 
-        inside = all([exd, amt]) and fy_start <= exd <= fy_end
-        if inside:
-            cash += amt
-            fran += amt * (fpc / 100.0)
-
-        rows.append({"ex": ex_raw, "parsed": str(exd), "amt": amt_raw,
-                     "amt_ok": amt is not None, "fran%": fpc, "in_FY": inside})
+            rows.append({"ex": ex_raw, "parsed": str(exd), "amt": amt_raw,
+                         "amt_ok": amt is not None, "fran%": fpc, "in_FY": inside})
 
     tot_fran = 0 if cash == 0 else round(fran / cash * 100, 2)
     return {"tot_cash": round(cash, 6), "tot_fran": tot_fran, "rows": rows}
@@ -177,7 +166,6 @@ def stock():
     symbol = normalise(raw)
     base   = symbol.split(".")[0]
 
-    # debug path
     if request.args.get("debug"):
         return jsonify(fetch_dividend_stats_debug(base)), 200
 
@@ -187,7 +175,6 @@ def stock():
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
     dividend12, franking = fetch_dividend_stats(base)
-
     return jsonify(symbol=symbol, price=price,
                    dividend12=dividend12, franking=franking)
 
