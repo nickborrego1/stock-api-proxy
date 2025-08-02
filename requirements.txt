@@ -1,8 +1,9 @@
-Flask
-flask-cors
-requests
-beautifulsoup4
-yfinance
-pandas   # only because yfinance pulls it in
-gunicorn
-python-dateutil>=2.9
+Flask==3.0.3
+flask-cors==4.0.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.1                # HTML parser for BS4
+yfinance==0.2.40
+pandas==2.2.2
+python-dateutil==2.9.0
+gunicorn==22.0.0
