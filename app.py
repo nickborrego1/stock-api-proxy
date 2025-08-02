@@ -1,20 +1,18 @@
-# app.py – ASX dividend proxy (InvestSMART, 2025-08-02)
-
+# app.py — ASX dividend proxy (InvestSMART, pagination-aware)
 from __future__ import annotations
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests, re, yfinance as yf
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 from datetime import datetime, date
 from dateutil import parser as dtparser
 
 app = Flask(__name__)
 CORS(app)
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 # ───────── helpers ──────────────────────────────────────────────────────────
 def normalise(raw: str) -> str:
@@ -31,19 +29,14 @@ def previous_fy_bounds(today: date | None = None) -> tuple[date, date]:
 def parse_exdate(txt: str):
     txt = (
         txt.replace("\u00a0", " ")
-        .replace("\u2011", "-")
-        .replace("\u2013", "-")
-        .replace("\u2014", "-")
-        .strip()
+           .replace("\u2011", "-")
+           .replace("\u2012", "-")
+           .replace("\u2013", "-")
+           .replace("\u2014", "-")
+           .strip()
     )
-    for fmt in (
-        "%d %b %Y",
-        "%d %B %Y",
-        "%d-%b-%Y",
-        "%d-%b-%y",
-        "%d/%m/%Y",
-        "%d %b %y",
-    ):
+    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d-%b-%y",
+                "%d/%m/%Y", "%d %b %y"):
         try:
             return datetime.strptime(txt, fmt).date()
         except ValueError:
@@ -57,15 +50,15 @@ def parse_exdate(txt: str):
 def clean_amount(cell: str) -> float | None:
     t = (
         cell.replace("\u00a0", "")
-        .replace(" ", "")
-        .replace("$", "")
-        .strip()
-        .lower()
+            .replace(" ", "")
+            .replace("$", "")
+            .strip()
+            .lower()
     )
-    for suffix in ("cpu", "c", "¢"):      # ← handles “61.8cpu”
+    for suffix in ("cpu", "c", "¢"):
         if t.endswith(suffix):
             try:
-                return float(t[: -len(suffix)]) / 100.0
+                return float(t[:-len(suffix)]) / 100.0
             except ValueError:
                 return None
     try:
@@ -75,6 +68,9 @@ def clean_amount(cell: str) -> float | None:
 
 
 # ───────── scrape core ──────────────────────────────────────────────────────
+HEADERS_PAYOUT = ("dividend", "amount", "distribution", "dist", "payout", "(cpu)")
+
+
 def wanted_table(tbl) -> bool:
     return "date" in " ".join(th.get_text(strip=True).lower() for th in tbl.find_all("th"))
 
@@ -87,56 +83,66 @@ def col_idx(headers: list[str], *keys: str) -> int | None:
     return None
 
 
-HEADERS_PAYOUT = ("dividend", "amount", "distribution", "dist", "distn", "payout", "(cpu)")
+def get_all_pages(start_url: str) -> list[BeautifulSoup]:
+    """Follow InvestSMART pagination links ?page=N&size=3 and return all soups."""
+    soups = []
+    next_url = start_url
+    while next_url:
+        html = requests.get(next_url, headers={"User-Agent": UA}, timeout=15).text
+        soup = BeautifulSoup(html, "html.parser")
+        soups.append(soup)
+        # look for ‘Next ›’ anchor inside .pagination
+        nxt = soup.select_one(".pagination a[rel='next']")
+        next_url = urljoin(start_url, nxt["href"]) if nxt else None
+    return soups
 
 
 def fetch_dividend_stats(code: str, debug: bool = False):
-    url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
-    soup = BeautifulSoup(
-        requests.get(url, headers={"User-Agent": UA}, timeout=15).text, "html.parser"
-    )
-    tables = [t for t in soup.find_all("table") if wanted_table(t)]
+    base_url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
+    soups = get_all_pages(base_url)             # ← NEW: crawl every page
 
     fy_start, fy_end = previous_fy_bounds()
     tot_cash = tot_fran_cash = 0.0
     rows = []
 
-    for tbl in tables:
-        hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-        ex_i = col_idx(hdrs, "ex") or 0
-        div_i = col_idx(hdrs, *HEADERS_PAYOUT)
-        fran_i = col_idx(hdrs, "franking")
-        if div_i is None:
-            if debug:
-                rows.append({"skipped": "no dividend column", "hdrs": hdrs})
-            continue
+    for soup in soups:
+        tables = [t for t in soup.find_all("table") if wanted_table(t)]
+        for tbl in tables:
+            hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
+            ex_i   = col_idx(hdrs, "ex") or 0
+            div_i  = col_idx(hdrs, *HEADERS_PAYOUT)
+            fran_i = col_idx(hdrs, "franking")
+            if div_i is None:
+                if debug:
+                    rows.append({"skipped": "no dividend column", "hdrs": hdrs})
+                continue
 
-        for tr in tbl.find_all("tr")[1:]:
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-            while len(cells) <= max(ex_i, div_i, (fran_i or 0)):
-                cells.append("")
+            for tr in tbl.find_all("tr")[1:]:
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+                while len(cells) <= max(ex_i, div_i, (fran_i or 0)):
+                    cells.append("")
 
-            ex_raw, amt_raw = cells[ex_i], cells[div_i]
-            exd = parse_exdate(ex_raw)
-            amt = clean_amount(amt_raw)
-            fpc = float(re.sub(r"[^\d.]", "", cells[fran_i])) if fran_i is not None else 0.0
+                ex_raw, amt_raw = cells[ex_i], cells[div_i]
+                exd = parse_exdate(ex_raw)
+                amt = clean_amount(amt_raw)
+                fpc = float(re.sub(r"[^\d.]", "", cells[fran_i])) if fran_i is not None else 0.0
 
-            inside = all([exd, amt]) and fy_start <= exd <= fy_end
-            if inside:
-                tot_cash += amt
-                tot_fran_cash += amt * (fpc / 100.0)
+                inside = all([exd, amt]) and fy_start <= exd <= fy_end
+                if inside:
+                    tot_cash += amt
+                    tot_fran_cash += amt * (fpc / 100.0)
 
-            if debug:
-                rows.append(
-                    {
-                        "ex": ex_raw,
-                        "parsed": str(exd),
-                        "amt": amt_raw,
-                        "amt_ok": amt is not None,
-                        "fran%": fpc,
-                        "in_FY": inside,
-                    }
-                )
+                if debug:
+                    rows.append(
+                        {
+                            "ex": ex_raw,
+                            "parsed": str(exd),
+                            "amt": amt_raw,
+                            "amt_ok": amt is not None,
+                            "fran%": fpc,
+                            "in_FY": inside,
+                        }
+                    )
 
     if debug:
         return {
@@ -174,7 +180,8 @@ def stock():
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
     dividend12, franking = fetch_dividend_stats(base)
-    return jsonify(symbol=symbol, price=price, dividend12=dividend12, franking=franking)
+    return jsonify(symbol=symbol, price=price,
+                   dividend12=dividend12, franking=franking)
 
 
 if __name__ == "__main__":
