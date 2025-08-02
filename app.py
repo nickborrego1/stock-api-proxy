@@ -1,6 +1,7 @@
+# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests, re, yfinance as yf, logging
+import requests, re, yfinance as yf
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 
@@ -99,22 +100,37 @@ def fetch_div_data(code: str):
 # routes
 # ──────────────────────────────────────────────────────────────────────
 @app.route("/")
-def root():
-    return "Stock API Proxy – /stock?symbol=CODE", 200
+def home():
+    return "Stock API Proxy – call /stock?symbol=CODE  (e.g. /stock?symbol=VHY)", 200
+
 
 @app.route("/stock")
 def stock():
-    raw = request.args.get("symbol","").strip()
-    if not raw:
+    raw = request.args.get("symbol", "")
+    if not raw.strip():
         return jsonify(error="No symbol provided"), 400
-    symbol   = normalise(raw)
-    basecode = symbol.split(".")[0]
 
-    # live price
-    try:    price = float(yf.Ticker(symbol).fast_info["lastPrice"])
+    symbol = normalise(raw)
+    base   = symbol.split(".")[0]
+
+    # 1) live price --------------------------------------------------
+    try:
+        price = float(yf.Ticker(symbol).fast_info["lastPrice"])
     except Exception as e:
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
-    dividend12, franking = fetch_div_data(basecode)
-    return jsonify(symbol=symbol, price=price,
-                   dividend12=dividend12, franking=franking)
+    # 2) dividends & franking ---------------------------------------
+    dividend12, franking = fetch_dividend_stats(base)
+
+    return jsonify(
+        symbol     = symbol,
+        price      = price,
+        dividend12 = dividend12,
+        franking   = franking
+    )
+
+
+# ------------------------------------------------------------------ #
+if __name__ == "__main__":
+    # local dev: python app.py
+    app.run(host="0.0.0.0", port=8080)
