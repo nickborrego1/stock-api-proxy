@@ -113,7 +113,6 @@ def get_all_pages(start_url: str) -> list[BeautifulSoup]:
         soup = BeautifulSoup(resp.text, "html.parser")
         soups.append(soup)
 
-        # Stop if the current page returned fewer than the maximum rows
         if rows_in_dividend_tables(soup) < ROWS_PER_PAGE:
             break
         page += 1
@@ -158,21 +157,21 @@ def fetch_dividend_stats(code: str, debug: bool = False):
                     franked_cash += amt * (fr_pct / 100.0)
 
                 if debug:
-                    dbg_rows.append(dict(
-                        ex=cells[ex_i],
-                        parsed=str(exd),
-                        amt=cells[div_i],
-                        amt_ok=amt is not None,
-                        fran%=fr_pct,
-                        in_FY=inside
-                    ))
+                    dbg_rows.append({
+                        "ex": cells[ex_i],
+                        "parsed": str(exd),
+                        "amt": cells[div_i],
+                        "amt_ok": amt is not None,
+                        "fran%": fr_pct,
+                        "in_FY": inside,
+                    })
 
     if debug:
-        return dict(
-            tot_cash=round(cash, 6),
-            tot_fran=0 if cash == 0 else round(franked_cash / cash * 100, 2),
-            rows=dbg_rows
-        )
+        return {
+            "tot_cash": round(cash, 6),
+            "tot_fran": 0 if cash == 0 else round(franked_cash / cash * 100, 2),
+            "rows": dbg_rows,
+        }
 
     return (None, None) if cash == 0 else (
         round(cash, 6),
