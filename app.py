@@ -1,10 +1,11 @@
-# app.py — ASX dividend proxy (InvestSMART, pagination-aware)
+# app.py — ASX dividend proxy (InvestSMART, pagination-aware & FY-correct)
 from __future__ import annotations
 
 from datetime import date, datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode
 
-import re, requests
+import re
+import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 from flask import Flask, jsonify, request
@@ -15,41 +16,37 @@ app = Flask(__name__)
 CORS(app)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0 Safari/537.36")
+ROWS_PER_PAGE = 250  # InvestSMART lets us choose up to 250 rows
 
 
 # ────────────────────────────────── helpers ──────────────────────────────────
 def normalise(raw: str) -> str:
-    """Translate e.g. 'vhy' → 'VHY.AX'."""
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
 
 
 def previous_fy_bounds(today: date | None = None) -> tuple[date, date]:
-    """Return start & end (inclusive) of the *previous* Australian FY."""
     today = today or datetime.utcnow().date()
     start_year = today.year - 1 if today.month >= 7 else today.year - 2
     return date(start_year, 7, 1), date(start_year + 1, 6, 30)
 
 
 def parse_exdate(txt: str) -> date | None:
-    """Robust date reader – accepts most formats InvestSMART emits."""
     txt = (
-        txt.replace("\u00a0", " ")       # NB-space
-           .replace("\u2011", "-")       # figure dash
-           .replace("\u2012", "-")       # en dash variants
+        txt.replace("\u00a0", " ")
+           .replace("\u2011", "-")
+           .replace("\u2012", "-")
            .replace("\u2013", "-")
            .replace("\u2014", "-")
            .strip()
     )
-    # First try a few exact strptime patterns (cheap)
     for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d-%b-%y",
                 "%d/%m/%Y", "%d %b %y"):
         try:
             return datetime.strptime(txt, fmt).date()
         except ValueError:
             continue
-    # Fall back to dateutil
     try:
         return dtparser.parse(txt, dayfirst=True).date()
     except Exception:
@@ -57,7 +54,6 @@ def parse_exdate(txt: str) -> date | None:
 
 
 def clean_amount(cell: str) -> float | None:
-    """Return the cash value per share in **dollars** (so 62 ¢ ➜ 0.62)."""
     t = (
         cell.replace("\u00a0", "")
             .replace(" ", "")
@@ -66,7 +62,6 @@ def clean_amount(cell: str) -> float | None:
             .strip()
             .lower()
     )
-    # Look for cent suffixes
     for suf in ("cpu", "c", "¢"):
         if t.endswith(suf):
             try:
@@ -86,33 +81,49 @@ def wanted_table(tbl) -> bool:
 
 
 def header_index(headers: list[str], *needles: str) -> int | None:
-    for n in needles:
-        for i, h in enumerate(headers):
+    needles = [n.lower() for n in needles]
+    for i, h in enumerate(headers):
+        for n in needles:
             if n in h:
                 return i
     return None
 
 
+def rows_in_dividend_tables(soup: BeautifulSoup) -> int:
+    return sum(len(t.find_all("tr")) - 1
+               for t in soup.find_all("table") if wanted_table(t))
+
+
 def get_all_pages(start_url: str) -> list[BeautifulSoup]:
-    """Follow `»` pagination links and return BeautifulSoup for every page."""
-    soups, next_url = [], start_url
-    while next_url:
-        html = requests.get(next_url,
-                            headers={"User-Agent": UA},
-                            timeout=15).text
-        soup = BeautifulSoup(html, "html.parser")
+    soups = []
+    session = requests.Session()
+    session.headers.update({"User-Agent": UA})
+
+    page = 1
+    while True:
+        url_parts = urlparse(start_url)
+        qs = dict(parse_qsl(url_parts.query))
+        qs["page"] = str(page)
+        url = url_parts._replace(query=urlencode(qs, doseq=True)).geturl()
+
+        resp = session.get(url, timeout=15)
+        if resp.status_code != 200:
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
         soups.append(soup)
 
-        # InvestSMART uses the right-chevron link without rel="next"
-        nxt = soup.select_one(".pagination a:contains('»')")
-        next_url = urljoin(start_url, nxt["href"]) if nxt else None
+        # Stop if the current page returned fewer than the maximum rows
+        if rows_in_dividend_tables(soup) < ROWS_PER_PAGE:
+            break
+        page += 1
+
     return soups
 
 
 def fetch_dividend_stats(code: str, debug: bool = False):
-    # Up to 250 rows on one page; if more, pagination still works.
     base_url = (f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
-                f"?size=250&OrderBy=6&OrderByOrientation=Descending")
+                f"?size={ROWS_PER_PAGE}&OrderBy=6&OrderByOrientation=Descending")
     soups = get_all_pages(base_url)
 
     fy_start, fy_end = previous_fy_bounds()
@@ -122,18 +133,16 @@ def fetch_dividend_stats(code: str, debug: bool = False):
     for soup in soups:
         for tbl in (t for t in soup.find_all("table") if wanted_table(t)):
             hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-            ex_i   = header_index(hdrs, "ex")             # ex-dividend date
+            ex_i   = header_index(hdrs, "ex")
             div_i  = header_index(hdrs, "dividend", "distribution", "payout")
-            fran_i = header_index(hdrs, "franking")
+            fran_i = header_index(hdrs, "franking", "imputation")
 
             if ex_i is None or div_i is None:
-                continue   # skip unexpected tables
+                continue
 
-            for tr in tbl.find_all("tr")[1:]:             # row 0 = header
+            for tr in tbl.find_all("tr")[1:]:
                 cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-
-                # Pad if row is shorter than expected (defensive)
-                while len(cells) <= max(ex_i, div_i, fran_i or 0):
+                while len(cells) <= max(ex_i, div_i, (fran_i or 0)):
                     cells.append("")
 
                 exd = parse_exdate(cells[ex_i])
@@ -149,19 +158,21 @@ def fetch_dividend_stats(code: str, debug: bool = False):
                     franked_cash += amt * (fr_pct / 100.0)
 
                 if debug:
-                    dbg_rows.append(
-                        dict(ex=cells[ex_i],
-                             parsed=str(exd),
-                             amt=cells[div_i],
-                             amt_ok=amt is not None,
-                             fran=fr_pct,
-                             in_FY=inside)
-                    )
+                    dbg_rows.append(dict(
+                        ex=cells[ex_i],
+                        parsed=str(exd),
+                        amt=cells[div_i],
+                        amt_ok=amt is not None,
+                        fran%=fr_pct,
+                        in_FY=inside
+                    ))
 
     if debug:
-        return dict(tot_cash=round(cash, 6),
-                    tot_fran=0 if cash == 0 else round(franked_cash / cash * 100, 2),
-                    rows=dbg_rows)
+        return dict(
+            tot_cash=round(cash, 6),
+            tot_fran=0 if cash == 0 else round(franked_cash / cash * 100, 2),
+            rows=dbg_rows
+        )
 
     return (None, None) if cash == 0 else (
         round(cash, 6),
@@ -182,25 +193,24 @@ def stock():
         return jsonify(error="No symbol provided"), 400
 
     symbol = normalise(raw)
-    base   = symbol.split(".")[0]          # e.g. VHY
+    base   = symbol.split(".")[0]
 
     if "debug" in request.args:
         return jsonify(fetch_dividend_stats(base, debug=True)), 200
 
-    # Spot price -------------------------------------------------------------
     try:
         price = float(yf.Ticker(symbol).fast_info["lastPrice"])
     except Exception as e:
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
-    # Dividends --------------------------------------------------------------
     dividend12, franking = fetch_dividend_stats(base)
-    return jsonify(symbol=symbol,
-                   price=price,
-                   dividend12=dividend12,
-                   franking=franking)
+    return jsonify(
+        symbol=symbol,
+        price=price,
+        dividend12=dividend12,
+        franking=franking
+    ), 200
 
 
 if __name__ == "__main__":
-    # gunicorn / render.com will override host/port; local dev only
     app.run(host="0.0.0.0", port=8080, debug=False)
