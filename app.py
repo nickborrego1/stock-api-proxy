@@ -22,22 +22,32 @@ def normalise(raw: str) -> str:
     return s if "." in s else f"{s}.AX"
 
 
+from dateutil import parser as dtparser        # ← new import (add near the top)
+
 def parse_exdate(txt: str) -> date | None:
-    """Handle the few date formats InvestSMART uses."""
-    txt = txt.strip()
+    """Parse InvestSMART ex-div dates."""
+    txt = txt.replace("\xa0", " ").strip()     # squash &nbsp;
+    # fast paths (faster than dateutil)
     for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(txt, fmt).date()
         except ValueError:
             continue
-    return None
+    # last-resort flexible parser
+    try:
+        return dtparser.parse(txt, dayfirst=True).date()
+    except Exception:
+        return None
 
 
 def clean_amount(cell_text: str) -> float | None:
-    """'$2.43'  → 2.43   |   '61.79¢' → 0.6179"""
-    t = cell_text.strip().replace("$", "")
-    if "¢" in t:
-        t = t.replace("¢", "")
+    """
+    '$2.43' → 2.43
+    '61.79¢' or '61.79c' → 0.6179
+    """
+    t = cell_text.strip().replace("$", "").replace(" ", "")
+    if t.lower().endswith(("c", "¢")):
+        t = t[:-1]  # drop c/¢
         try:
             return float(t) / 100.0
         except ValueError:
