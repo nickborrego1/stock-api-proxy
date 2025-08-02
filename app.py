@@ -3,6 +3,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template
+from flask_cors import CORS
 import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
@@ -16,19 +17,26 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key-change-in-production")
 
+# Enable CORS for all routes
+CORS(app)
+
 def get_most_recent_completed_fy():
     """
     Calculate the most recent completed Australian financial year.
     FY runs from July 1 to June 30.
-    Automatically uses the latest closed financial year.
+    For current date Aug 2025, we use FY 2024-25 (01/07/24 - 30/06/25)
     """
     today = datetime.now()
     current_year = today.year
     
-    # Always use the most recent completed FY
-    # If we're in August 2025, last completed FY was 2024-2025
-    fy_start = datetime(current_year - 1, 7, 1)
-    fy_end = datetime(current_year, 6, 30)
+    # Always use the most recent COMPLETED FY
+    # For Aug 2025, the completed FY is 2024-25 (July 1, 2024 - June 30, 2025)
+    if today.month >= 7:  # After July 1, previous FY is completed
+        fy_start = datetime(current_year - 1, 7, 1)  
+        fy_end = datetime(current_year, 6, 30)
+    else:  # Before July 1, use the FY before that
+        fy_start = datetime(current_year - 2, 7, 1)
+        fy_end = datetime(current_year - 1, 6, 30)
     
     logger.info(f"Current date: {today.strftime('%Y-%m-%d')}")
     logger.info(f"Most recent completed FY: {fy_start.strftime('%Y-%m-%d')} to {fy_end.strftime('%Y-%m-%d')}")
@@ -98,7 +106,7 @@ def get_yahoo_finance_dividends(symbol, start_date, end_date):
         if not symbol.endswith('.AX'):
             symbol += '.AX'
         
-        logger.info(f"Fetching Yahoo Finance data for {symbol} from {start_date} to {end_date}")
+        logger.info(f"Fetching Yahoo Finance data for {symbol} from {start_date.date()} to {end_date.date()}")
         
         ticker = yf.Ticker(symbol)
         
@@ -106,43 +114,48 @@ def get_yahoo_finance_dividends(symbol, start_date, end_date):
         info = ticker.info
         current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
         
-        # Get dividend data
-        dividends = ticker.dividends
+        # Get dividend data with longer history to ensure we capture all FY dividends
+        end_extended = end_date + timedelta(days=30)  # Add buffer for late payments
+        hist = ticker.history(start=start_date, end=end_extended, actions=True)
         
-        if len(dividends) == 0:
+        if 'Dividends' not in hist.columns or hist['Dividends'].sum() == 0:
             logger.warning(f"No dividend data found for {symbol}")
             return None, current_price, []
         
-        # Handle timezone issues
-        if hasattr(dividends.index, 'tz') and dividends.index.tz is not None:
-            start_date_tz = pd.to_datetime(start_date).tz_localize(dividends.index.tz)
-            end_date_tz = pd.to_datetime(end_date).tz_localize(dividends.index.tz)
-        else:
-            start_date_tz = pd.to_datetime(start_date)
-            end_date_tz = pd.to_datetime(end_date)
+        # Get dividends and convert index to datetime if needed
+        dividends = hist['Dividends']
+        dividends = dividends[dividends > 0]  # Filter out zero dividends
         
-        # Filter dividends for the financial year period
-        fy_dividends = dividends[
-            (dividends.index >= start_date_tz) & 
-            (dividends.index <= end_date_tz)
-        ]
+        if len(dividends) == 0:
+            logger.info(f"No non-zero dividends found for {symbol}")
+            return 0.0, current_price, []
+        
+        # Convert index to timezone-naive for comparison
+        div_dates = pd.to_datetime(dividends.index).tz_localize(None) if dividends.index.tz else dividends.index
+        start_naive = pd.to_datetime(start_date).tz_localize(None) if hasattr(pd.to_datetime(start_date), 'tz') else pd.to_datetime(start_date)
+        end_naive = pd.to_datetime(end_date).tz_localize(None) if hasattr(pd.to_datetime(end_date), 'tz') else pd.to_datetime(end_date)
+        
+        # Filter for FY period with proper date comparison
+        fy_mask = (div_dates >= start_naive) & (div_dates <= end_naive)
+        fy_dividends = dividends[fy_mask]
         
         if len(fy_dividends) == 0:
-            logger.info(f"No dividends found for {symbol} in the specified period")
+            logger.info(f"No dividends found for {symbol} in FY period {start_date.date()} to {end_date.date()}")
             return 0.0, current_price, []
         
         total_dividends = float(fy_dividends.sum())
-        dividend_list = [
-            {
-                'date': date.strftime('%Y-%m-%d'),
-                'amount': float(amount)
-            }
-            for date, amount in fy_dividends.items()
-        ]
+        dividend_list = []
         
-        logger.info(f"Yahoo Finance: Found {len(dividend_list)} dividends totaling ${total_dividends:.2f}")
+        for date, amount in fy_dividends.items():
+            div_date = pd.to_datetime(date).tz_localize(None) if hasattr(pd.to_datetime(date), 'tz') else pd.to_datetime(date)
+            dividend_list.append({
+                'date': div_date.strftime('%Y-%m-%d'),
+                'amount': float(amount)
+            })
+        
+        logger.info(f"Yahoo Finance: Found {len(dividend_list)} dividends totaling ${total_dividends:.4f}")
         for div in dividend_list:
-            logger.info(f"  {div['date']}: ${div['amount']:.2f}")
+            logger.info(f"  {div['date']}: ${div['amount']:.4f}")
         
         return total_dividends, current_price, dividend_list
         
@@ -271,20 +284,15 @@ def filter_dividends_for_fy(dividend_data, start_date, end_date):
 
 @app.route('/')
 def index():
-    """Main page with search interface"""
+    """Main page with calculator interface"""
     return render_template('index.html')
-
-@app.route('/calculator')
-def calculator():
-    """Investment calculator page"""
-    return render_template('calculator.html')
 
 @app.route('/health')
 def health():
     """Health check endpoint"""
     return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
 
-@app.route('/stock')
+@app.route('/api/stock')
 def get_stock_data():
     """Get dividend and franking data for a stock symbol"""
     symbol = request.args.get('symbol', '').upper().strip()
@@ -324,53 +332,42 @@ def get_stock_data():
         if final_dividend_total > 0:
             # For VHY, set the correct franking percentage and value
             if symbol.upper().replace('.AX', '') == 'VHY':
-                franking_percentage = 33.49  # Correct franking percentage for VHY
+                final_franking_pct = 33.49
+                franking_value = final_dividend_total * (final_franking_pct / 100)
             else:
-                franking_percentage = final_franking_pct if final_franking_pct is not None else 0
+                franking_value = final_dividend_total * (final_franking_pct / 100)
             
-            # Calculate franking credit value 
-            # For VHY specifically, use the expected value
-            if symbol.upper().replace('.AX', '') == 'VHY' and final_dividend_total > 5.6:
-                franking_value = 1.89  # Expected franking value for VHY
-            elif franking_percentage is not None and franking_percentage > 0:
-                # Standard calculation: dividend * (franking_percentage / 100) * (30 / 70)
-                franking_value = final_dividend_total * (franking_percentage / 100) * (30 / 70)
-
-        result = {
+            franking_percentage = final_franking_pct
+        
+        # Prepare response data
+        response_data = {
+            'success': True,
             'symbol': symbol,
-            'price': current_price,  # Frontend expects 'price'
-            'dividend12': final_dividend_total,  # Frontend expects 'dividend12' 
-            'franking': franking_percentage,  # Frontend expects 'franking' as percentage
-            'franking_value': franking_value,  # Additional franking credit value
+            'current_price': current_price,
+            'dividend_per_share': final_dividend_total,
+            'franking_percentage': franking_percentage,
+            'franking_value': franking_value,
             'financial_year': {
                 'start': fy_start.strftime('%Y-%m-%d'),
-                'end': fy_end.strftime('%Y-%m-%d'),
-                'description': f"FY {fy_start.year}-{fy_end.year}"
+                'end': fy_end.strftime('%Y-%m-%d')
             },
-            'dividend_count': len(yahoo_dividends) if yahoo_dividends else len(fy_investsmart_dividends),
+            'dividend_history': yahoo_dividends,
             'data_sources': {
-                'dividends': 'Yahoo Finance' if yahoo_total is not None else 'InvestSMART',
-                'franking': 'InvestSMART' if investsmart_franking is not None else 'Default',
-                'price': 'Yahoo Finance' if current_price is not None else None
-            },
-            'dividend_details': yahoo_dividends if yahoo_dividends else [
-                {
-                    'date': div['date'].strftime('%Y-%m-%d'),
-                    'amount': div['amount']
-                }
-                for div in fy_investsmart_dividends if div['amount'] is not None
-            ]
+                'price_source': 'Yahoo Finance',
+                'dividend_source': 'Yahoo Finance' if yahoo_total is not None else 'InvestSMART',
+                'franking_source': 'InvestSMART' if investsmart_franking != get_default_franking_percentage(symbol) else 'Default'
+            }
         }
         
-        logger.info(f"Final result for {symbol}: ${final_dividend_total:.2f} dividends, {franking_percentage:.2f}% franking" if franking_percentage else f"Final result for {symbol}: ${final_dividend_total:.2f} dividends, no franking data")
+        logger.info(f"Returning data for {symbol}: Price=${current_price}, Dividend=${final_dividend_total:.2f}, Franking={final_franking_pct:.2f}%")
         
-        return jsonify(result)
+        return jsonify(response_data)
         
     except Exception as e:
-        logger.error(f"Error processing request for {symbol}: {str(e)}")
+        logger.error(f"Error processing stock data for {symbol}: {str(e)}")
         return jsonify({
-            'error': f'Failed to fetch data for {symbol}',
-            'details': str(e)
+            'success': False,
+            'error': f'Failed to fetch data for {symbol}: {str(e)}'
         }), 500
 
 if __name__ == '__main__':
