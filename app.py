@@ -1,18 +1,18 @@
-# app.py — ASX dividend proxy (InvestSMART, pagination-aware)
+# app.py — ASX dividend proxy (InvestSMART, pagination-aware, v2)
 from __future__ import annotations
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests, re, yfinance as yf
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 from datetime import datetime, date
 from dateutil import parser as dtparser
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 CORS(app)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0 Safari/537.36")
 
 # ───────── helpers ──────────────────────────────────────────────────────────
 def normalise(raw: str) -> str:
@@ -83,72 +83,77 @@ def col_idx(headers: list[str], *keys: str) -> int | None:
     return None
 
 
-def get_all_pages(start_url: str) -> list[BeautifulSoup]:
-    """Follow InvestSMART pagination links ?page=N&size=3 and return all soups."""
-    soups = []
-    next_url = start_url
-    while next_url:
-        html = requests.get(next_url, headers={"User-Agent": UA}, timeout=15).text
-        soup = BeautifulSoup(html, "html.parser")
-        soups.append(soup)
-        # look for ‘Next ›’ anchor inside .pagination
-        nxt = soup.select_one(".pagination a[rel='next']")
-        next_url = urljoin(start_url, nxt["href"]) if nxt else None
-    return soups
+def build_url(code: str, size: int = 250) -> str:
+    """
+    Query parameters:
+      * OrderBy          6   -> "Ex-dividend date" column
+      * OrderByOrientation Desc -> newest first
+      * size             250 -> more than enough for typical ETF history
+    """
+    params = {
+        "size": size,
+        "OrderBy": 6,
+        "OrderByOrientation": "Descending",
+    }
+    return (f"https://www.investsmart.com.au/shares/asx-{code.lower()}"
+            f"/dividends?{urlencode(params)}")
 
 
 def fetch_dividend_stats(code: str, debug: bool = False):
-    base_url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
-    soups = get_all_pages(base_url)             # ← NEW: crawl every page
+    url = build_url(code)
+    html = requests.get(url, headers={"User-Agent": UA}, timeout=15).text
+    soup = BeautifulSoup(html, "html.parser")
 
     fy_start, fy_end = previous_fy_bounds()
     tot_cash = tot_fran_cash = 0.0
-    rows = []
+    rows_dbg = []
 
-    for soup in soups:
-        tables = [t for t in soup.find_all("table") if wanted_table(t)]
-        for tbl in tables:
-            hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-            ex_i   = col_idx(hdrs, "ex") or 0
-            div_i  = col_idx(hdrs, *HEADERS_PAYOUT)
-            fran_i = col_idx(hdrs, "franking")
-            if div_i is None:
-                if debug:
-                    rows.append({"skipped": "no dividend column", "hdrs": hdrs})
-                continue
+    tables = [t for t in soup.find_all("table") if wanted_table(t)]
+    for tbl in tables:
+        hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
+        ex_i   = col_idx(hdrs, "ex") or 0
+        div_i  = col_idx(hdrs, *HEADERS_PAYOUT)
+        fran_i = col_idx(hdrs, "franking")
+        if div_i is None:
+            continue
 
-            for tr in tbl.find_all("tr")[1:]:
-                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-                while len(cells) <= max(ex_i, div_i, (fran_i or 0)):
-                    cells.append("")
+        for tr in tbl.find_all("tr")[1:]:
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            while len(cells) <= max(ex_i, div_i, (fran_i or 0)):
+                cells.append("")
 
-                ex_raw, amt_raw = cells[ex_i], cells[div_i]
-                exd = parse_exdate(ex_raw)
-                amt = clean_amount(amt_raw)
+            ex_raw, amt_raw = cells[ex_i], cells[div_i]
+            exd = parse_exdate(ex_raw)
+            amt = clean_amount(amt_raw)
+
+            # handle blank / “–” franking gracefully
+            try:
                 fpc = float(re.sub(r"[^\d.]", "", cells[fran_i])) if fran_i is not None else 0.0
+            except ValueError:
+                fpc = 0.0
 
-                inside = all([exd, amt]) and fy_start <= exd <= fy_end
-                if inside:
-                    tot_cash += amt
-                    tot_fran_cash += amt * (fpc / 100.0)
+            inside = all([exd, amt]) and fy_start <= exd <= fy_end
+            if inside:
+                tot_cash += amt
+                tot_fran_cash += amt * (fpc / 100.0)
 
-                if debug:
-                    rows.append(
-                        {
-                            "ex": ex_raw,
-                            "parsed": str(exd),
-                            "amt": amt_raw,
-                            "amt_ok": amt is not None,
-                            "fran%": fpc,
-                            "in_FY": inside,
-                        }
-                    )
+            if debug:
+                rows_dbg.append(
+                    {
+                        "ex": ex_raw,
+                        "parsed": str(exd),
+                        "amt": amt_raw,
+                        "amt_ok": amt is not None,
+                        "fran%": fpc,
+                        "in_FY": inside,
+                    }
+                )
 
     if debug:
         return {
             "tot_cash": round(tot_cash, 6),
             "tot_fran": 0 if tot_cash == 0 else round(tot_fran_cash / tot_cash * 100, 2),
-            "rows": rows,
+            "rows": rows_dbg,
         }
 
     if tot_cash == 0:
