@@ -1,5 +1,4 @@
-# app.py  – ASX dividend proxy (InvestSMART)
-
+# app.py — ASX dividend proxy via InvestSMART
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests, re, yfinance as yf
@@ -10,12 +9,10 @@ from dateutil import parser as dtparser
 app = Flask(__name__)
 CORS(app)
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
-# ───────── helpers ──────────────────────────────────────────────────────────
+# ---------- helpers ---------------------------------------------------------
 def normalise(raw: str) -> str:
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
@@ -29,14 +26,8 @@ def previous_fy_bounds(today: date | None = None) -> tuple[date, date]:
 
 def parse_exdate(txt: str):
     txt = txt.replace("\xa0", " ").strip()
-    for fmt in (
-        "%d %b %Y",
-        "%d %B %Y",
-        "%d-%b-%Y",
-        "%d-%b-%y",      # ← handles ‘01-Oct-24’
-        "%d/%m/%Y",
-        "%d %b %y",
-    ):
+    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d-%b-%y",
+                "%d/%m/%Y", "%d %b %y"):
         try:
             return datetime.strptime(txt, fmt).date()
         except ValueError:
@@ -59,11 +50,10 @@ def clean_amount(cell: str) -> float | None:
     except ValueError:
         return None
 
-
-# ───────── scrape ───────────────────────────────────────────────────────────
+# ---------- scrape ----------------------------------------------------------
 def wanted_table(tbl) -> bool:
     hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-    return "date" in " ".join(hdrs)  # any table that has a Date/Ex-Date column
+    return "date" in " ".join(hdrs)
 
 
 def col_idx(headers: list[str], *keys: str) -> int | None:
@@ -74,125 +64,9 @@ def col_idx(headers: list[str], *keys: str) -> int | None:
     return None
 
 
-def fetch_dividend_stats(code: str) -> tuple[float | None, float | None]:
+def fetch_dividend_stats(code: str):
     url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
     html = requests.get(url, headers={"User-Agent": UA}, timeout=15).text
-    soup = BeautifulSoup(html, "html.parser")
-    tables = [t for t in soup.find_all("table") if wanted_table(t)]
-
-    fy_start, fy_end = previous_fy_bounds()
-    tot_cash = tot_fran_cash = 0.0
-
-    for tbl in tables:
-        hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-        ex_i = col_idx(hdrs, "ex") or 0
-        div_i = col_idx(hdrs, "dividend", "amount", "distribution")
-        fran_i = col_idx(hdrs, "franking")
-        if div_i is None:
-            continue
-
-        for tr in tbl.find_all("tr")[1:]:
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-            while len(cells) <= max(ex_i, div_i, (fran_i or 0)):
-                cells.append("")
-
-            exd = parse_exdate(cells[ex_i])
-            if not exd or not (fy_start <= exd <= fy_end):
-                continue
-
-            amt = clean_amount(cells[div_i])
-            if amt is None:
-                continue
-
-            fr_pct = (
-                float(re.sub(r"[^\d.]", "", cells[fran_i])) if fran_i is not None else 0.0
-            )
-
-            tot_cash += amt
-            tot_fran_cash += amt * (fr_pct / 100.0)
-
-    if tot_cash == 0:
-        return None, None
-    return round(tot_cash, 6), round(tot_fran_cash / tot_cash * 100, 2)
-
-
-# ───────── optional debug view ──────────────────────────────────────────────
-def fetch_dividend_stats_debug(code: str):
-    fy_start, fy_end = previous_fy_bounds()
-    cash = fran = 0.0
-    rows = []
-
-    url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
-    soup = BeautifulSoup(requests.get(url, headers={"User-Agent": UA}, timeout=15).text, "html.parser")
-    tables = [t for t in soup.find_all("table") if wanted_table(t)]
-
-    for tbl in tables:
-        hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-        ex_i = col_idx(hdrs, "ex") or 0
-        div_i = col_idx(hdrs, "dividend", "amount", "distribution")
-        fran_i = col_idx(hdrs, "franking")
-        if div_i is None:
-            continue
-
-        for tr in tbl.find_all("tr")[1:]:
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-            while len(cells) <= max(ex_i, div_i, (fran_i or 0)):
-                cells.append("")
-
-            ex_raw, amt_raw = cells[ex_i], cells[div_i]
-            exd = parse_exdate(ex_raw)
-            amt = clean_amount(amt_raw)
-            fpc = float(re.sub(r"[^\d.]", "", cells[fran_i])) if fran_i is not None else 0.0
-
-            inside = all([exd, amt]) and fy_start <= exd <= fy_end
-            if inside:
-                cash += amt
-                fran += amt * (fpc / 100.0)
-
-            rows.append(
-                {
-                    "ex": ex_raw,
-                    "parsed": str(exd),
-                    "amt": amt_raw,
-                    "amt_ok": amt is not None,
-                    "fran%": fpc,
-                    "in_FY": inside,
-                }
-            )
-
-    tot_fran = 0 if cash == 0 else round(fran / cash * 100, 2)
-    return {"tot_cash": round(cash, 6), "tot_fran": tot_fran, "rows": rows}
-
-
-# ───────── Flask routes ─────────────────────────────────────────────────────
-@app.route("/")
-def home():
-    return "Stock API Proxy – /stock?symbol=CODE", 200
-
-
-@app.route("/stock")
-def stock():
-    raw = request.args.get("symbol", "")
-    if not raw.strip():
-        return jsonify(error="No symbol provided"), 400
-
-    symbol = normalise(raw)
-    base = symbol.split(".")[0]
-
-    if request.args.get("debug"):
-        return jsonify(fetch_dividend_stats_debug(base)), 200
-
-    try:
-        price = float(yf.Ticker(symbol).fast_info["lastPrice"])
-    except Exception as e:
-        return jsonify(error=f"Price fetch failed: {e}"), 500
-
-    dividend12, franking = fetch_dividend_stats(base)
-    return jsonify(symbol=symbol, price=price, dividend12=dividend12, franking=franking)
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
     soup = BeautifulSoup(html, "html.parser")
     tables = [t for t in soup.find_all("table") if wanted_table(t)]
 
@@ -228,15 +102,14 @@ if __name__ == "__main__":
         return None, None
     return round(tot_cash, 6), round(tot_fran_cash / tot_cash * 100, 2)
 
-# ---------- debug helper ----------------------------------------------------
+
 def fetch_dividend_stats_debug(code: str):
     fy_start, fy_end = previous_fy_bounds()
     cash = fran = 0.0
     rows = []
 
     url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
-    soup = BeautifulSoup(requests.get(url, headers={"User-Agent": UA},
-                                      timeout=15).text, "html.parser")
+    soup = BeautifulSoup(requests.get(url, headers={"User-Agent": UA}, timeout=15).text, "html.parser")
     tables = [t for t in soup.find_all("table") if wanted_table(t)]
 
     for tbl in tables:
@@ -265,13 +138,15 @@ def fetch_dividend_stats_debug(code: str):
                          "amt": amt_raw, "amt_ok": amt is not None,
                          "fran%": fpc, "in_FY": inside})
 
-    tot_fran = 0 if cash == 0 else round(fran / cash * 100, 2)
-    return {"tot_cash": round(cash, 6), "tot_fran": tot_fran, "rows": rows}
+    return {"tot_cash": round(cash, 6),
+            "tot_fran": 0 if cash == 0 else round(fran / cash * 100, 2),
+            "rows": rows}
 
 # ---------- Flask -----------------------------------------------------------
 @app.route("/")
 def home():
     return "Stock API Proxy – /stock?symbol=CODE", 200
+
 
 @app.route("/stock")
 def stock():
@@ -280,7 +155,7 @@ def stock():
         return jsonify(error="No symbol provided"), 400
 
     symbol = normalise(raw)
-    base   = symbol.split(".")[0]
+    base = symbol.split(".")[0]
 
     if request.args.get("debug"):
         return jsonify(fetch_dividend_stats_debug(base)), 200
@@ -294,5 +169,6 @@ def stock():
     return jsonify(symbol=symbol, price=price,
                    dividend12=dividend12, franking=franking)
 
+# ---------- run -------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
