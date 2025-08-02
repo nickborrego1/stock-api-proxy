@@ -1,4 +1,4 @@
-# app.py – robust ASX dividend proxy (InvestSMART)
+# app.py – ASX dividend proxy (InvestSMART, 2025-08-02)
 
 from __future__ import annotations
 from flask import Flask, request, jsonify
@@ -16,7 +16,7 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
-# ───────── helpers ───────────────────────────────────────────────────────────
+# ───────── helpers ──────────────────────────────────────────────────────────
 def normalise(raw: str) -> str:
     s = raw.strip().upper()
     return s if "." in s else f"{s}.AX"
@@ -29,18 +29,20 @@ def previous_fy_bounds(today: date | None = None) -> tuple[date, date]:
 
 
 def parse_exdate(txt: str):
-    # normalise odd dashes & spaces first
     txt = (
-        txt.replace("\u00a0", " ")   # nbsp
-           .replace("\u2011", "-")   # non-breaking hyphen
-           .replace("\u2013", "-")   # en dash
-           .replace("\u2014", "-")   # em dash
-           .strip()
+        txt.replace("\u00a0", " ")
+        .replace("\u2011", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .strip()
     )
     for fmt in (
-        "%d %b %Y", "%d %B %Y",
-        "%d-%b-%Y", "%d-%b-%y",
-        "%d/%m/%Y", "%d %b %y"
+        "%d %b %Y",
+        "%d %B %Y",
+        "%d-%b-%Y",
+        "%d-%b-%y",
+        "%d/%m/%Y",
+        "%d %b %y",
     ):
         try:
             return datetime.strptime(txt, fmt).date()
@@ -54,26 +56,27 @@ def parse_exdate(txt: str):
 
 def clean_amount(cell: str) -> float | None:
     t = (
-        cell.replace("\u00a0", "")  # nbsp
-            .replace(" ", "")
-            .replace("$", "")
-            .strip()
+        cell.replace("\u00a0", "")
+        .replace(" ", "")
+        .replace("$", "")
+        .strip()
+        .lower()
     )
-    if t.lower().endswith(("c", "¢")):
-        try:
-            return float(t[:-1]) / 100.0
-        except ValueError:
-            return None
+    for suffix in ("cpu", "c", "¢"):      # ← handles “61.8cpu”
+        if t.endswith(suffix):
+            try:
+                return float(t[: -len(suffix)]) / 100.0
+            except ValueError:
+                return None
     try:
         return float(t)
     except ValueError:
         return None
 
 
-# ───────── scraping core ────────────────────────────────────────────────────
+# ───────── scrape core ──────────────────────────────────────────────────────
 def wanted_table(tbl) -> bool:
-    hdrs = " ".join(th.get_text(strip=True).lower() for th in tbl.find_all("th"))
-    return "date" in hdrs                    # any table with a date column
+    return "date" in " ".join(th.get_text(strip=True).lower() for th in tbl.find_all("th"))
 
 
 def col_idx(headers: list[str], *keys: str) -> int | None:
@@ -84,20 +87,14 @@ def col_idx(headers: list[str], *keys: str) -> int | None:
     return None
 
 
-HEADERS_PAYOUT = (
-    "dividend",
-    "amount",
-    "distribution",
-    "dist",
-    "distn",          # seen on some LICs
-    "payout",
-    "(cpu)",
-)
+HEADERS_PAYOUT = ("dividend", "amount", "distribution", "dist", "distn", "payout", "(cpu)")
+
 
 def fetch_dividend_stats(code: str, debug: bool = False):
     url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
-    html = requests.get(url, headers={"User-Agent": UA}, timeout=15).text
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(
+        requests.get(url, headers={"User-Agent": UA}, timeout=15).text, "html.parser"
+    )
     tables = [t for t in soup.find_all("table") if wanted_table(t)]
 
     fy_start, fy_end = previous_fy_bounds()
@@ -106,8 +103,8 @@ def fetch_dividend_stats(code: str, debug: bool = False):
 
     for tbl in tables:
         hdrs = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
-        ex_i   = col_idx(hdrs, "ex") or 0
-        div_i  = col_idx(hdrs, *HEADERS_PAYOUT)
+        ex_i = col_idx(hdrs, "ex") or 0
+        div_i = col_idx(hdrs, *HEADERS_PAYOUT)
         fran_i = col_idx(hdrs, "franking")
         if div_i is None:
             if debug:
@@ -125,14 +122,6 @@ def fetch_dividend_stats(code: str, debug: bool = False):
             fpc = float(re.sub(r"[^\d.]", "", cells[fran_i])) if fran_i is not None else 0.0
 
             inside = all([exd, amt]) and fy_start <= exd <= fy_end
-            reason = None
-            if not exd:
-                reason = "date-parse-fail"
-            elif amt is None:
-                reason = "amt-parse-fail"
-            elif not inside:
-                reason = "outside_FY"
-
             if inside:
                 tot_cash += amt
                 tot_fran_cash += amt * (fpc / 100.0)
@@ -146,7 +135,6 @@ def fetch_dividend_stats(code: str, debug: bool = False):
                         "amt_ok": amt is not None,
                         "fran%": fpc,
                         "in_FY": inside,
-                        "why_skip": reason,
                     }
                 )
 
@@ -186,12 +174,7 @@ def stock():
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
     dividend12, franking = fetch_dividend_stats(base)
-    return jsonify(
-        symbol=symbol,
-        price=price,
-        dividend12=dividend12,
-        franking=franking,
-    )
+    return jsonify(symbol=symbol, price=price, dividend12=dividend12, franking=franking)
 
 
 if __name__ == "__main__":
