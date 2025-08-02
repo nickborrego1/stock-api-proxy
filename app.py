@@ -1,4 +1,3 @@
-# app.py — ASX dividend proxy (InvestSMART, robust pagination & row-shift handling)
 from __future__ import annotations
 
 from datetime import date, datetime
@@ -65,7 +64,6 @@ def clean_amount_cell(td: Tag) -> Optional[float]:
     if amt is not None:
         return amt
 
-    # fallback – look at raw HTML
     html = td.decode_contents()
     m = re.search(r"(\d+(?:\.\d+)?)\s*(cpu|c|¢)?", html, flags=re.I)
     if not m:
@@ -81,14 +79,12 @@ def wanted_table(tbl) -> bool:
 
 
 def header_index(headers: list[str], *needles: str) -> Optional[int]:
-    """Exact header match preferred; fallback to substring."""
     needles = [n.lower() for n in needles]
-
-    for n in needles:          # exact
+    for n in needles:
         for i, h in enumerate(headers):
             if h.strip() == n:
                 return i
-    for n in needles:          # substring
+    for n in needles:
         for i, h in enumerate(headers):
             if n in h:
                 return i
@@ -96,7 +92,6 @@ def header_index(headers: list[str], *needles: str) -> Optional[int]:
 
 
 def get_all_pages(start_url: str) -> list[BeautifulSoup]:
-    """Follow ‘next’ pagination links until exhausted."""
     soups, next_url = [], start_url
     sess = requests.Session()
     sess.headers["User-Agent"] = UA
@@ -106,7 +101,6 @@ def get_all_pages(start_url: str) -> list[BeautifulSoup]:
         soup = BeautifulSoup(html, "html.parser")
         soups.append(soup)
 
-        # look for <li class="next"> or <a rel="next">
         nxt_li = soup.find("li", class_=lambda c: c and "next" in c.lower())
         nxt_a  = (nxt_li.a if nxt_li and nxt_li.a else
                   soup.find("a", rel=lambda r: r and "next" in r.lower()))
@@ -137,12 +131,12 @@ def fetch_dividend_stats(code: str, debug: bool = False):
             for tr in tbl.find_all("tr")[1:]:
                 tds = tr.find_all(["td", "th"])
 
-                # Detect rows that have extra leading cells (page puts "H F Result" etc.)
-                shift = max(0, len(tds) - len(hdrs))
+                shift = len(tds) - len(hdrs)
 
+                # ---------- one-line fix ----------
                 def adj(idx: int) -> int:
-                    # extra cells appear before the Dividend column
-                    return idx + shift if shift and idx >= div_i else idx
+                    return idx + shift if shift and idx >= ex_i else idx
+                # ----------------------------------
 
                 exd = parse_exdate(tds[adj(ex_i)].get_text(" ", strip=True))
                 amt = clean_amount_cell(tds[adj(div_i)])
