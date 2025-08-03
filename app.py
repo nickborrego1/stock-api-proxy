@@ -84,10 +84,7 @@ def parse_amount(s: str):
 
 # ─────────────────────── routes ───────────────────────────
 @app.route("/")
-def index():
-    return render_template("index.html")
-
-
+@app.route("/index")
 @app.route("/calculator")
 def calculator():
     return render_template("calculator.html")
