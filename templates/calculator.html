@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Dividend Calculator</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; }
+    input { margin-right: 0.5rem; }
+    pre { background: #f4f4f4; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Dividend Calculator</h1>
+  <p>Enter an ASX ticker (e.g. <code>BHP.AX</code>) and click Fetch:</p>
+  <input id="symbol" placeholder="Ticker" />
+  <button id="fetchBtn">Fetch</button>
+  <pre id="output"></pre>
+
+  <script>
+    async function fetchStock() {
+      const symbol = document.getElementById('symbol').value.trim();
+      const output = document.getElementById('output');
+      if (!symbol) {
+        output.textContent = 'Please enter a symbol.';
+        return;
+      }
+      output.textContent = 'Loading...';
+      try {
+        const response = await fetch(`/stock?symbol=${encodeURIComponent(symbol)}`);
+        if (!response.ok) {
+          const err = await response.json();
+          output.textContent = err.error || 'Error fetching data';
+          return;
+        }
+        const data = await response.json();
+        output.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        output.textContent = err.toString();
+      }
+    }
+
+    document.getElementById('fetchBtn').addEventListener('click', fetchStock);
+  </script>
+</body>
+</html>
