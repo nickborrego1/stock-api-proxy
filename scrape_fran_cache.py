@@ -31,7 +31,7 @@ def fetch_franking_asx(code: str):
     resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(resp.text, "lxml")
     table = soup.find("table")
     if not table or not table.tbody:
         print(f"‼️  No table found for {code}")
