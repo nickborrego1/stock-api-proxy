@@ -1,41 +1,67 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Dividend Calculator</title>
+  <meta charset="utf-8" />
+  <title>ASX Dividend Finder</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 2rem; }
-    input { margin-right: 0.5rem; }
-    pre { background: #f4f4f4; padding: 1rem; }
+    input { margin-right: 0.5rem; padding: 0.25rem 0.5rem; }
+    button { padding: 0.25rem 0.75rem; }
+    table { margin-top: 1rem; border-collapse: collapse; }
+    th, td { padding: 0.5rem 1rem; border-bottom: 1px solid #ccc; text-align: right; }
+    th { text-align: left; }
+    #error { color: #c00; margin-top: 1rem; }
   </style>
 </head>
 <body>
-  <h1>Dividend Calculator</h1>
-  <p>Enter an ASX ticker (e.g. <code>BHP.AX</code>) and click Fetch:</p>
+  <h1>ASX Dividend Finder</h1>
+  <p>Enter an ASX ticker (e.g. <code>BHP</code> or <code>BHP.AX</code>):</p>
   <input id="symbol" placeholder="Ticker" />
   <button id="fetchBtn">Fetch</button>
-  <pre id="output"></pre>
+
+  <div id="error"></div>
+  <table id="result" style="display:none">
+    <tr><th>Symbol</th><td id="r-symbol"></td></tr>
+    <tr><th>Last Price</th><td id="r-price"></td></tr>
+    <tr><th>Dividend (FY)</th><td id="r-dividend"></td></tr>
+    <tr><th>Franking Credit ($)</th><td id="r-fran-cash"></td></tr>
+    <tr><th>Franking (%)</th><td id="r-fran-pct"></td></tr>
+    <tr><th>Yield (%)</th><td id="r-yield"></td></tr>
+  </table>
+
+  <p style="margin-top:1rem;font-size:0.9rem;color:#555;">Data sourced from Yahoo Finance &amp; InvestSMART. For informational purposes only.</p>
 
   <script>
+    function format(n, decimals = 2) {
+      return (n === null || n === undefined) ? '-' : Number(n).toFixed(decimals);
+    }
+
     async function fetchStock() {
       const symbol = document.getElementById('symbol').value.trim();
-      const output = document.getElementById('output');
+      const error = document.getElementById('error');
+      const table = document.getElementById('result');
+      error.textContent = '';
+      table.style.display = 'none';
       if (!symbol) {
-        output.textContent = 'Please enter a symbol.';
+        error.textContent = 'Please enter a symbol.';
         return;
       }
-      output.textContent = 'Loading...';
       try {
         const response = await fetch(`/stock?symbol=${encodeURIComponent(symbol)}`);
+        const data = await response.json();
         if (!response.ok) {
-          const err = await response.json();
-          output.textContent = err.error || 'Error fetching data';
+          error.textContent = data.error || 'Error fetching data';
           return;
         }
-        const data = await response.json();
-        output.textContent = JSON.stringify(data, null, 2);
+        document.getElementById('r-symbol').textContent = data.symbol;
+        document.getElementById('r-price').textContent = format(data.price);
+        document.getElementById('r-dividend').textContent = format(data.dividend12);
+        document.getElementById('r-fran-cash').textContent = format(data.franking_cash);
+        document.getElementById('r-fran-pct').textContent = format(data.franking_pct);
+        document.getElementById('r-yield').textContent = format(data.yield_pct);
+        table.style.display = 'table';
       } catch (err) {
-        output.textContent = err.toString();
+        error.textContent = err.toString();
       }
     }
 
@@ -43,3 +69,4 @@
   </script>
 </body>
 </html>
+

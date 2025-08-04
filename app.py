@@ -1,5 +1,5 @@
 # app.py  –  Stock API proxy (InvestSMART)
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import requests, re, yfinance as yf
 from bs4 import BeautifulSoup
@@ -138,7 +138,7 @@ def fetch_dividend_stats(code: str) -> tuple[float | None, float | None]:
 # ------------------------------------------------------------------ #
 @app.route("/")
 def home():
-    return "Stock API Proxy – call /stock?symbol=CODE  (e.g. /stock?symbol=VHY)", 200
+    return render_template("calculator.html"), 200
 
 
 @app.route("/stock")
@@ -157,13 +157,23 @@ def stock():
         return jsonify(error=f"Price fetch failed: {e}"), 500
 
     # 2) dividends & franking ---------------------------------------
-    dividend12, franking = fetch_dividend_stats(base)
+    dividend12, franking_pct = fetch_dividend_stats(base)
+
+    franking_cash = None
+    if dividend12 is not None and franking_pct is not None:
+        franking_cash = round(dividend12 * (franking_pct / 100.0), 6)
+
+    yield_pct = None
+    if dividend12 is not None and price:
+        yield_pct = round((dividend12 / price) * 100, 2)
 
     return jsonify(
-        symbol     = symbol,
-        price      = price,
-        dividend12 = dividend12,
-        franking   = franking
+        symbol        = symbol,
+        price         = price,
+        dividend12    = dividend12,
+        franking_pct  = franking_pct,
+        franking_cash = franking_cash,
+        yield_pct     = yield_pct
     )
 
 
