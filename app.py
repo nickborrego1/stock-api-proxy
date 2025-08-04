@@ -1,167 +1,174 @@
-from flask import Flask, jsonify
+# app.py  –  Stock API proxy (InvestSMART)
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-import yfinance as yf
-import requests
+import requests, re, yfinance as yf
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-import re
-import json
+from datetime import datetime, date, timedelta
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
-def get_last_completed_fy():
-    today = datetime.now()
-    if today.month < 7:  # Current year FY hasn't ended yet
-        start_date = datetime(today.year - 2, 7, 1)
-        end_date = datetime(today.year - 1, 6, 30)
-    else:
-        start_date = datetime(today.year - 1, 7, 1)
-        end_date = datetime(today.year, 6, 30)
-    return start_date, end_date
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 
-def fetch_yahoo_dividends(ticker, start_date, end_date):
+# ------------------------------------------------------------------ #
+# helpers
+# ------------------------------------------------------------------ #
+def normalise(raw: str) -> str:
+    """'vhy' → 'VHY.AX'.  If suffix already supplied, keep it."""
+    s = raw.strip().upper()
+    return s if "." in s else f"{s}.AX"
+
+
+def parse_exdate(txt: str) -> date | None:
+    """Handle the few date formats InvestSMART uses."""
+    txt = txt.strip()
+    for fmt in ("%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(txt, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def clean_amount(cell_text: str) -> float | None:
+    """'$2.43'  → 2.43   |   '61.79¢' → 0.6179"""
+    t = cell_text.strip().replace("$", "")
+    if "¢" in t:
+        t = t.replace("¢", "")
+        try:
+            return float(t) / 100.0
+        except ValueError:
+            return None
     try:
-        # Append .AX for ASX stocks
-        stock = yf.Ticker(f"{ticker}.AX")
-        company_name = stock.info.get('longName', ticker)
-        current_price = stock.info.get('currentPrice', 0)
-        
-        # Get dividend history
-        dividends = stock.dividends
-        
-        if dividends.empty:
-            return None, None, None, None
-        
-        # Filter for the financial year
-        fy_dividends = dividends.loc[start_date:end_date]
-        
-        if fy_dividends.empty:
-            return None, None, None, None
-        
-        total_dividend = fy_dividends.sum()
-        return company_name, current_price, total_dividend, fy_dividends
-    
-    except Exception as e:
-        print(f"Yahoo Finance error: {str(e)}")
-        return None, None, None, None
+        return float(t)
+    except ValueError:
+        return None
 
-def fetch_investsmart_franking(ticker):
+
+def previous_fy_bounds(today: date | None = None) -> tuple[date, date]:
+    """
+    Return (start, end) of the *last completed* AU financial year.
+    • If today is 2025-08-02 → bounds are 2024-07-01 … 2025-06-30
+    • If today is 2025-03-15 → bounds are 2023-07-01 … 2024-06-30
+    """
+    if today is None:
+        today = datetime.utcnow().date()
+
+    if today.month >= 7:           # we are already in the new FY
+        start_year = today.year - 1
+    else:                          # still in Jan-Jun → go back two
+        start_year = today.year - 2
+
+    start = date(start_year,     7, 1)
+    end   = date(start_year + 1, 6, 30)
+    return start, end
+
+
+# ------------------------------------------------------------------ #
+# main scrape  (InvestSMART)
+# ------------------------------------------------------------------ #
+def fetch_dividend_stats(code: str) -> tuple[float | None, float | None]:
+    """
+    Returns (cash_dividend_last_FY, weighted_fran_pct) or (None, None)
+    code: plain ASX code e.g. 'VHY'
+    """
+    url = f"https://www.investsmart.com.au/shares/asx-{code.lower()}/dividends"
+
     try:
-        url = f"https://www.investsmart.com.au/shares/asx-{ticker.lower()}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Find franking information
-        franking_data = {}
-        franking_section = soup.find('h3', string='Dividend Franking')
-        
-        if not franking_section:
-            # Try alternative headings
-            franking_section = soup.find('h3', string=re.compile(r'Dividend Franking', re.IGNORECASE))
-        
-        if franking_section:
-            table = franking_section.find_next('table')
-            if table:
-                rows = table.find_all('tr')
-                for row in rows[1:]:  # Skip header
-                    cols = row.find_all('td')
-                    if len(cols) >= 3:
-                        date_str = cols[0].text.strip()
-                        amount = cols[1].text.strip()
-                        franking = cols[2].text.strip()
-                        
-                        # Convert date to standard format
-                        try:
-                            date = datetime.strptime(date_str, '%d/%m/%y')
-                            date_key = date.strftime('%Y-%m-%d')
-                        except ValueError:
-                            date_key = date_str
-                            
-                        # Extract franking percentage
-                        franking_percent = 0
-                        if franking == 'Fully Franked':
-                            franking_percent = 100
-                        elif franking == 'Unfranked':
-                            franking_percent = 0
-                        else:
-                            # Extract percentage from text
-                            match = re.search(r'(\d+)%', franking)
-                            if match:
-                                franking_percent = int(match.group(1))
-                        
-                        franking_data[date_key] = franking_percent
-        
-        return franking_data
-    
+        res = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        res.raise_for_status()
     except Exception as e:
-        print(f"InvestSMART error: {str(e)}")
-        return {}
+        print("InvestSMART request error:", e)
+        return None, None
 
-def calculate_totals(dividends, franking_data):
-    total_dividend = dividends.sum()
-    dividend_count = len(dividends)
-    dividend_average = total_dividend / dividend_count if dividend_count > 0 else 0
-    
-    total_franking_credits = 0
-    franking_percentages = []
-    
-    # Match dividends with franking data
-    for date, amount in dividends.items():
-        date_str = date.strftime('%Y-%m-%d')
-        franking_percent = franking_data.get(date_str, 0)
-        
-        # Calculate franking credits (AUS tax rate 30%)
-        franking_credit = amount * (franking_percent / 100) * (0.3 / 0.7)
-        total_franking_credits += franking_credit
-        franking_percentages.append(franking_percent)
-    
-    avg_franking = sum(franking_percentages) / len(franking_percentages) if franking_percentages else 0
-    
-    return {
-        "dividend_total": round(total_dividend, 4),
-        "dividend_average": round(dividend_average, 4),
-        "franking_total": round(total_franking_credits, 4),
-        "franking_percent_average": round(avg_franking, 2)
-    }
+    soup = BeautifulSoup(res.text, "html.parser")
+    div_tbl = None
+    for tbl in soup.find_all("table"):
+        hdr = [th.get_text(strip=True).lower() for th in tbl.find_all("th")]
+        if {"dividend", "franking"}.issubset(hdr):
+            div_tbl = tbl
+            break
+    if div_tbl is None:
+        return None, None
 
-@app.route('/fetch_dividend_data/<ticker>')
-def fetch_dividend_data(ticker):
-    # Get financial year dates
-    start_date, end_date = get_last_completed_fy()
-    fy_str = f"{start_date.strftime('%d/%m/%Y')} to {end_date.strftime('%d/%m/%Y')}"
-    
-    # Fetch data from sources
-    company_name, current_price, total_dividend, dividends = fetch_yahoo_dividends(
-        ticker, start_date, end_date
+    hdr = [th.get_text(strip=True).lower() for th in div_tbl.find_all("th")]
+    try:
+        ex_i   = next(i for i, h in enumerate(hdr) if "ex" in h and "date" in h)
+        div_i  = hdr.index("dividend")
+        fran_i = hdr.index("franking")
+    except (ValueError, StopIteration):
+        return None, None
+
+    fy_start, fy_end = previous_fy_bounds()
+    tot_div_cash = tot_fran_cash = 0.0
+
+    for tr in div_tbl.find("tbody").find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) <= max(ex_i, div_i, fran_i):
+            continue
+
+        exd = parse_exdate(tds[ex_i].get_text())
+        if not exd or exd < fy_start or exd > fy_end:
+            continue
+
+        amt = clean_amount(tds[div_i].get_text())
+        if amt is None:
+            continue
+
+        try:
+            fran_pct = float(re.sub(r"[^\d.]", "", tds[fran_i].get_text()))
+        except ValueError:
+            fran_pct = 0.0
+
+        tot_div_cash   += amt
+        tot_fran_cash  += amt * (fran_pct / 100.0)
+
+    if tot_div_cash == 0:
+        return None, None
+
+    weighted_pct = round((tot_fran_cash / tot_div_cash) * 100, 2)
+    return round(tot_div_cash, 6), weighted_pct
+
+
+# ------------------------------------------------------------------ #
+# Flask routes
+# ------------------------------------------------------------------ #
+@app.route("/")
+def home():
+    return "Stock API Proxy – call /stock?symbol=CODE  (e.g. /stock?symbol=VHY)", 200
+
+
+@app.route("/stock")
+def stock():
+    raw = request.args.get("symbol", "")
+    if not raw.strip():
+        return jsonify(error="No symbol provided"), 400
+
+    symbol = normalise(raw)
+    base   = symbol.split(".")[0]
+
+    # 1) live price --------------------------------------------------
+    try:
+        price = float(yf.Ticker(symbol).fast_info["lastPrice"])
+    except Exception as e:
+        return jsonify(error=f"Price fetch failed: {e}"), 500
+
+    # 2) dividends & franking ---------------------------------------
+    dividend12, franking = fetch_dividend_stats(base)
+
+    return jsonify(
+        symbol     = symbol,
+        price      = price,
+        dividend12 = dividend12,
+        franking   = franking
     )
-    
-    if not company_name:
-        return jsonify({
-            "error": "Sorry, we couldn't fetch dividend data for this ticker. Please try another or contact support.",
-            "status": "error"
-        }), 404
-    
-    franking_data = fetch_investsmart_franking(ticker)
-    
-    # Calculate results
-    results = calculate_totals(dividends, franking_data)
-    
-    return jsonify({
-        "company": company_name,
-        "ticker": ticker,
-        "current_price": current_price,
-        "financial_year": fy_str,
-        "dividend_total": results["dividend_total"],
-        "dividend_average": results["dividend_average"],
-        "franking_total": results["franking_total"],
-        "franking_percent_average": results["franking_percent_average"],
-        "sources": ["Yahoo Finance", "InvestSMART"],
-        "status": "success"
-    })
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
+# ------------------------------------------------------------------ #
+if __name__ == "__main__":
+    # local dev:  python app.py
+    app.run(host="0.0.0.0", port=8080)
+
